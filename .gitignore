@@ -1,0 +1,18 @@
+# scratch: logs, run captures and build output
+_scratch/
+
+# build output
+*.exe
+*.o
+*.obj
+tinylm
+
+# runtime artifacts: weights, tokenized corpora, checkpoints
+models/
+data/
+out/
+*.bin
+*.bin.opt
+
+__pycache__/
+*.pyc
