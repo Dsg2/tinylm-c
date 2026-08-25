@@ -130,6 +130,159 @@ static double wtime(void){
 #endif
 }
 
+/* --------------------- decode thread pool (not OpenMP) ------------------- */
+/* Decode is one token at a time, so every parallel region is a few hundred KB
+ * of work. Measured on an i5-1135G7 with LS-220M-A25M-q8, libgomp is a net LOSS
+ * at that granularity: 1 thread 146 tok/s, 2 -> 85, 4 -> 116, 8 -> 95. Worse,
+ * it costs ~30% even at one thread, because `parallel for ... if(cond)` with
+ * cond false STILL calls GOMP_parallel and builds a one-thread team -- RMSNorm
+ * over a 512-float vector was taking 11.7 us against ~0.2 us of arithmetic.
+ * OMP_WAIT_POLICY / OMP_PROC_BIND / GOMP_SPINCOUNT do not recover it.
+ *
+ * Microbenchmark, one expert's D=512 -> F=707 int8 GEMV, weights drawn from a
+ * 12x16 expert pool so nothing caches:
+ *     libgomp parallel for : 44.5 us (1t) -> 106.7 us (8t)   2.4x SLOWER
+ *     this pool            : 38.4 us (1t) ->  10.2 us (7t)   3.8x faster
+ *                            10.6 GB/s    ->  39.8 GB/s
+ * Same kernel, same split. The difference is entirely fork/join.
+ *
+ * Workers are created once, park on an atomic ticket, and each takes a
+ * contiguous range of output rows; the caller runs range 0 itself and spins on
+ * a done-counter, so there is no thread handoff on the critical path.
+ *
+ * The pool is live ONLY while generating (gen_new brings it up, atexit tears it
+ * down). Training keeps OpenMP -- there a region is a whole batch and fork/join
+ * is amortised. The two must never run at once or they oversubscribe the
+ * machine, which is what g_pool_nt guards: the kernels shared between decode
+ * and training (mm, mm_bt, rmsnorm_fwd, rope_apply) test it and take the pool
+ * instead of the pragma. Decode-only kernels have no pragma left at all. */
+#define TL_MAXT 64
+typedef void (*tl_body)(void *ctx, int lo, int hi, int tid);
+static int  g_pool_nt = 1;                  /* workers incl. the caller; 1 = off */
+static tl_body       tlp_fn;
+static void         *tlp_ctx;
+static int           tlp_n;
+static volatile long tlp_ticket = 0;        /* bumped once per dispatch */
+static volatile long tlp_done   = 0;
+static volatile int  tlp_stop   = 0;
+
+#ifdef _WIN32
+__declspec(dllimport) void* __stdcall CreateThread(void*, size_t,
+        unsigned long (__stdcall *)(void*), void*, unsigned long, unsigned long*);
+__declspec(dllimport) unsigned long __stdcall WaitForSingleObject(void*, unsigned long);
+__declspec(dllimport) int  __stdcall CloseHandle(void*);
+__declspec(dllimport) int  __stdcall SwitchToThread(void);
+__declspec(dllimport) void __stdcall Sleep(unsigned long);
+typedef void *tl_thread_t;
+static void tl_yield(void){ SwitchToThread(); }
+static void tl_nap(void){ Sleep(1); }
+#else
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+typedef pthread_t tl_thread_t;
+static void tl_yield(void){ sched_yield(); }
+static void tl_nap(void){ usleep(1000); }
+#endif
+static tl_thread_t tlp_th[TL_MAXT];
+
+static void tlp_run(long id){
+    int n=tlp_n, nt=g_pool_nt;
+    int lo=(int)(((long long)n*id)/nt), hi=(int)(((long long)n*(id+1))/nt);
+    if(hi>lo) tlp_fn(tlp_ctx, lo, hi, (int)id);
+}
+/* Spin, then yield, then nap. A pure spin would fight the OS for a core the
+ * moment generation pauses at a chat prompt; a pure sleep would put a 1-15 ms
+ * wakeup on a dispatch that takes 10 us. During decode the ticket changes every
+ * few microseconds, so the pause arm is the only one that ever runs. */
+static void tlp_loop(long id){
+    long seen=0;
+    for(;;){
+        long t, spins=0;
+        while((t=__atomic_load_n(&tlp_ticket,__ATOMIC_ACQUIRE))==seen){
+            if(__atomic_load_n(&tlp_stop,__ATOMIC_RELAXED)) return;
+            if(++spins < 4000)       _mm_pause();
+            else if(spins < 24000)   tl_yield();
+            else                     tl_nap();
+        }
+        seen=t;
+        if(__atomic_load_n(&tlp_stop,__ATOMIC_RELAXED)) return;
+        tlp_run(id);
+        __atomic_add_fetch(&tlp_done,1,__ATOMIC_RELEASE);
+    }
+}
+#ifdef _WIN32
+static unsigned long __stdcall tlp_entry(void *a){ tlp_loop((long)(intptr_t)a); return 0; }
+#else
+static void *tlp_entry(void *a){ tlp_loop((long)(intptr_t)a); return NULL; }
+#endif
+
+/* Fan `n` items out over the pool. Publishing (fn,ctx,n) happens-before the
+ * release bump of the ticket, which the workers acquire-load, so no lock is
+ * needed for the descriptor. */
+static void tl_for(int n, tl_body fn, void *ctx){
+    int nt=g_pool_nt;
+    if(nt<=1 || n<nt){ if(n>0) fn(ctx,0,n,0); return; }
+    tlp_fn=fn; tlp_ctx=ctx; tlp_n=n;
+    __atomic_store_n(&tlp_done,0,__ATOMIC_RELAXED);
+    __atomic_add_fetch(&tlp_ticket,1,__ATOMIC_RELEASE);
+    tlp_run(0);
+    while(__atomic_load_n(&tlp_done,__ATOMIC_ACQUIRE) < nt-1) _mm_pause();
+}
+static void tlp_shutdown(void){
+    if(g_pool_nt<=1) return;
+    int nt=g_pool_nt;
+    __atomic_store_n(&tlp_stop,1,__ATOMIC_RELAXED);
+    __atomic_add_fetch(&tlp_ticket,1,__ATOMIC_RELEASE);
+    g_pool_nt=1;                             /* tl_for is serial from here on */
+    for(int i=1;i<nt;i++){
+#ifdef _WIN32
+        WaitForSingleObject(tlp_th[i],2000); CloseHandle(tlp_th[i]);
+#else
+        pthread_join(tlp_th[i],NULL);
+#endif
+    }
+}
+/* TINYLM_THREADS wins, then OMP_NUM_THREADS (so existing scripts keep working),
+ * else one fewer than the logical cores -- measured best at 7 of 8 here; 8 is
+ * ~6% down because the last hyperthread contends with the caller. */
+static int tl_default_threads(void){
+    const char *e=getenv("TINYLM_THREADS");
+    if(!e||!*e) e=getenv("OMP_NUM_THREADS");
+    if(e&&*e){ int v=atoi(e); if(v>0) return v<TL_MAXT?v:TL_MAXT; }
+    int np=0;
+#ifdef _OPENMP
+    np=omp_get_num_procs();
+#endif
+    if(np<=0){ const char *p=getenv("NUMBER_OF_PROCESSORS"); np=p?atoi(p):0; }
+    if(np<=0) np=4;
+    if(np>TL_MAXT) np=TL_MAXT;
+    return np>2 ? np-1 : np;
+}
+static int exact_gemv_on(void);
+static int exact_exp_on(void);
+static int prof_on(void);
+static void tlp_init(void){
+    if(g_pool_nt>1) return;
+    /* Force the lazy getenv() flags to resolve on this thread before any worker
+     * exists. They are `static int v=-1` one-shots; the write is idempotent, but
+     * resolving them up front keeps the workers' inner loops off that path. */
+    exact_gemv_on(); exact_exp_on(); prof_on();
+    int nt=tl_default_threads();
+    if(nt<=1) return;
+    g_pool_nt=nt;                            /* workers read this to size ranges */
+    for(int i=1;i<nt;i++){
+#ifdef _WIN32
+        tlp_th[i]=CreateThread(NULL,0,tlp_entry,(void*)(intptr_t)i,0,NULL);
+        if(!tlp_th[i]){ g_pool_nt=i; break; }
+#else
+        if(pthread_create(&tlp_th[i],NULL,tlp_entry,(void*)(intptr_t)i)!=0){ g_pool_nt=i; break; }
+#endif
+    }
+    atexit(tlp_shutdown);
+    if(getenv("TINYLM_PROF")) fprintf(stderr,"[tinylm] decode pool: %d threads\n", g_pool_nt);
+}
+
 /* directory containing the running executable, so named models live in one place
  * (models/ next to tinylm.exe) regardless of the current working directory. */
 __declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(void*, char*, unsigned long);
@@ -235,14 +388,34 @@ static void init_params(const Cfg *c, Weights *w){
  * (4x the arithmetic per load + ILP). The contiguous inner loop vectorizes to
  * AVX2/512 FMA. Mathematically identical to the naive ikj form (verified by
  * `tinylm selftest`); only low-order fp bits differ under -ffast-math. */
+typedef struct { float *Y; const float *X,*W; int M,K,N; } MMJob;
+static void mm_range(float *restrict Y, const float *restrict X, const float *restrict W,
+                     int M, int K, int N, int blo, int bhi);
+static void mmbt_range(float *restrict dX, const float *restrict dY, const float *restrict W,
+                       int M, int K, int N, int lo, int hi);
+static void mm_body(void *p,int lo,int hi,int tid){
+    MMJob *j=(MMJob*)p; (void)tid; mm_range(j->Y,j->X,j->W,j->M,j->K,j->N,lo,hi);
+}
+static void mmbt_body(void *p,int lo,int hi,int tid){
+    MMJob *j=(MMJob*)p; (void)tid; mmbt_range(j->Y,j->X,j->W,j->M,j->K,j->N,lo,hi);
+}
 /* Y[M*N] = X[M*K] @ W[K*N]                      (set) */
 static void mm(float *restrict Y, const float *restrict X, const float *restrict W,
                int M, int K, int N){
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasNoTrans,M,N,K,1.0f,X,K,W,N,0.0f,Y,N); return;
 #endif
-    #pragma omp parallel for schedule(static) if(M>1)
-    for(int m0=0;m0<M;m0+=4){
+    int nblk=(M+3)/4;
+    MMJob j={Y,X,W,M,K,N};
+    if(nblk==1 || g_pool_nt>1){ tl_for(nblk, mm_body, &j); return; }
+    #pragma omp parallel for schedule(static)
+    for(int b=0;b<nblk;b++) mm_range(Y,X,W,M,K,N,b,b+1);
+}
+/* One 4-row block range of `mm`, so the same body serves the serial path, the
+ * pool and the OpenMP training path without being written three times. */
+static void mm_range(float *restrict Y, const float *restrict X, const float *restrict W,
+                     int M, int K, int N, int blo, int bhi){
+    for(int m0=blo*4; m0<M && m0<bhi*4; m0+=4){
         int mb = M-m0<4 ? M-m0 : 4;
         if(mb==4){
             const float *restrict x0=X+(size_t)m0*K, *restrict x1=x0+K,
@@ -273,8 +446,15 @@ static void mm_bt(float *restrict dX, const float *restrict dY, const float *res
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasTrans,M,K,N,1.0f,dY,N,W,N,1.0f,dX,K); return;
 #endif
-    #pragma omp parallel for schedule(static) if(M>1)
-    for(int m=0;m<M;m++){
+    MMJob j={dX,dY,W,M,K,N};
+    if(M==1 || g_pool_nt>1){ tl_for(M, mmbt_body, &j); return; }
+    #pragma omp parallel for schedule(static)
+    for(int m=0;m<M;m++) mmbt_range(dX,dY,W,M,K,N,m,m+1);
+}
+static void mmbt_range(float *restrict dX, const float *restrict dY, const float *restrict W,
+                       int M, int K, int N, int lo, int hi){
+    (void)M;
+    for(int m=lo;m<hi;m++){
         const float *restrict dy = dY + (size_t)m*N;
         float *restrict dx = dX + (size_t)m*K;
         int k=0;
@@ -321,15 +501,29 @@ static void mm_atb(float *restrict dW, const float *restrict X, const float *res
 }
 
 /* ----------------------------- rmsnorm ---------------------------------- */
-static void rmsnorm_fwd(const float *x, const float *g, float *out, float *rinv,
-                        int rows, int D){
-    #pragma omp parallel for schedule(static) if(rows>1)
-    for(int r=0;r<rows;r++){
+typedef struct { const float *x,*g; float *out,*rinv; int D; } RmsJob;
+static void rms_range(const float *x, const float *g, float *out, float *rinv,
+                      int D, int lo, int hi){
+    for(int r=lo;r<hi;r++){
         const float *xr=x+(size_t)r*D; float *or_=out+(size_t)r*D;
         float ms=0.0f; for(int i=0;i<D;i++) ms+=xr[i]*xr[i];
         float s=1.0f/sqrtf(ms/D + 1e-5f); rinv[r]=s;
         for(int i=0;i<D;i++) or_[i]=xr[i]*s*g[i];
     }
+}
+static void rms_body(void *p,int lo,int hi,int tid){
+    RmsJob *j=(RmsJob*)p; (void)tid; rms_range(j->x,j->g,j->out,j->rinv,j->D,lo,hi);
+}
+static void rmsnorm_fwd(const float *x, const float *g, float *out, float *rinv,
+                        int rows, int D){
+    /* rows==1 is the decode case and MUST NOT touch libgomp: an `if(rows>1)`
+       clause still calls GOMP_parallel for a one-thread team, which measured
+       11.7 us per call against ~0.2 us of arithmetic. */
+    if(rows==1){ rms_range(x,g,out,rinv,D,0,1); return; }
+    RmsJob j={x,g,out,rinv,D};
+    if(g_pool_nt>1){ tl_for(rows, rms_body, &j); return; }
+    #pragma omp parallel for schedule(static)
+    for(int r=0;r<rows;r++) rms_range(x,g,out,rinv,D,r,r+1);
 }
 /* given dy (grad of out), add to dx and dg */
 static void rmsnorm_bwd(const float *x, const float *g, const float *rinv,
@@ -374,9 +568,10 @@ static void rope_init(const Cfg *c, int maxpos){
     }
 }
 /* apply rope in place to a [rows][nheads*hd] buffer; rows indexed by absolute pos via pos[] */
-static void rope_apply(float *buf, const int *pos, int rows, int nheads, int hd, int half, int back){
-    #pragma omp parallel for schedule(static) if(rows>1)
-    for(int r=0;r<rows;r++){
+typedef struct { float *buf; const int *pos; int nheads,hd,half,back; } RopeJob;
+static void rope_range(float *buf, const int *pos, int nheads, int hd, int half, int back,
+                       int lo, int hi){
+    for(int r=lo;r<hi;r++){
         int t=pos[r];
         for(int h=0;h<nheads;h++){
             float *v = buf + (size_t)r*nheads*hd + (size_t)h*hd;
@@ -388,6 +583,17 @@ static void rope_apply(float *buf, const int *pos, int rows, int nheads, int hd,
             }
         }
     }
+}
+static void rope_body(void *p,int lo,int hi,int tid){
+    RopeJob *j=(RopeJob*)p; (void)tid;
+    rope_range(j->buf,j->pos,j->nheads,j->hd,j->half,j->back,lo,hi);
+}
+static void rope_apply(float *buf, const int *pos, int rows, int nheads, int hd, int half, int back){
+    if(rows==1){ rope_range(buf,pos,nheads,hd,half,back,0,1); return; }  /* see rmsnorm_fwd */
+    RopeJob j={buf,pos,nheads,hd,half,back};
+    if(g_pool_nt>1){ tl_for(rows, rope_body, &j); return; }
+    #pragma omp parallel for schedule(static)
+    for(int r=0;r<rows;r++) rope_range(buf,pos,nheads,hd,half,back,r,r+1);
 }
 
 /* ----------------------------- activations ------------------------------ */
@@ -1238,9 +1444,9 @@ static int cmd_train(int argc, char **argv){
     int spe=(int)(ntr/((size_t)B*c.T)); if(spe<1)spe=1;
     int iters=(int)(epochs*spe + 0.5f); if(iters<1)iters=1;
     if(iters<start_iter) iters=start_iter;
-    int nthreads=1;
+    int nthreads=g_pool_nt;
     #ifdef _OPENMP
-    nthreads=omp_get_max_threads();
+    nthreads=g_pool_nt>1?g_pool_nt:omp_get_max_threads();
     #endif
     printf("[train] model=%s %s params=%zu threads=%d n_mtp=%d batch=%d\n",
            name, fresh?"(fresh)":"(resume)", np, nthreads, c.n_mtp, B);
@@ -1360,6 +1566,38 @@ static QMat qmat_KN(const float *W, int K, int N){   /* W[K][N] (mm reduces K) -
         q8_row(col,K,m.q+(size_t)n*kp,m.s+(size_t)n*nb); }
     free(col); return m;
 }
+/* Q, K and V are three separate [K][*] matrices that all consume the SAME normed
+ * activation row, so they are concatenated output-major into one QMat: one
+ * q8_row of x instead of three, one pool dispatch instead of three, and one
+ * contiguous weight stream instead of three. */
+static QMat qmat_KN3(const float *Wq, const float *Wk, const float *Wv,
+                     int K, int Nq, int Nk, int Nv){
+    int nb=(K+31)/32, kp=nb*32, N=Nq+Nk+Nv; QMat m;
+    m.q=malloc((size_t)N*kp); m.s=malloc(sizeof(float)*(size_t)N*nb);
+    float *col=malloc(sizeof(float)*K);
+    const float *src[3]={Wq,Wk,Wv}; int cnt[3]={Nq,Nk,Nv}; int o=0;
+    for(int t=0;t<3;t++)
+        for(int n=0;n<cnt[t];n++,o++){
+            for(int k=0;k<K;k++) col[k]=src[t][(size_t)k*cnt[t]+n];
+            q8_row(col,K,m.q+(size_t)o*kp,m.s+(size_t)o*nb);
+        }
+    free(col); return m;
+}
+/* W1 and W3 interleaved: row 2n is W1's column n, row 2n+1 is W3's. Both feed
+ * the same SwiGLU output element, so this turns two streams 362 KB apart (for
+ * the 220M's experts) into one contiguous walk. */
+static QMat qmat_KN_ilv(const float *Wa, const float *Wb, int K, int N){
+    int nb=(K+31)/32, kp=nb*32; QMat m;
+    m.q=malloc((size_t)2*N*kp); m.s=malloc(sizeof(float)*(size_t)2*N*nb);
+    float *col=malloc(sizeof(float)*K);
+    for(int n=0;n<N;n++){
+        for(int k=0;k<K;k++) col[k]=Wa[(size_t)k*N+n];
+        q8_row(col,K,m.q+(size_t)(2*n)*kp,   m.s+(size_t)(2*n)*nb);
+        for(int k=0;k<K;k++) col[k]=Wb[(size_t)k*N+n];
+        q8_row(col,K,m.q+(size_t)(2*n+1)*kp, m.s+(size_t)(2*n+1)*nb);
+    }
+    free(col); return m;
+}
 static QMat qmat_NK(const float *W, int N, int K){   /* W[N][K] (emb) -> quant as-is */
     int nb=(K+31)/32, kp=nb*32; QMat m;
     m.q=malloc((size_t)N*kp); m.s=malloc(sizeof(float)*(size_t)N*nb);
@@ -1367,15 +1605,23 @@ static QMat qmat_NK(const float *W, int N, int K){   /* W[N][K] (emb) -> quant a
     return m;
 }
 static int8_t *gq_xq=NULL; static float *gq_xs=NULL; static int gq_cap=0;
+/* Fanned out over the decode pool, never OpenMP: at m=1 a whole GEMV is a few
+ * hundred KB, which is below libgomp's fork/join cost (see the pool comment). */
+typedef struct { const QMat *m; const int8_t *xq; const float *xs; float *Y; int nb,kp; } GemvJob;
+static void gemv_body(void *p,int lo,int hi,int tid){
+    GemvJob *j=(GemvJob*)p; (void)tid;
+    for(int n=lo;n<hi;n++)
+        j->Y[n]=qdot_row(j->m->q+(size_t)n*j->kp, j->m->s+(size_t)n*j->nb, j->xq, j->xs, j->nb);
+}
 /* Y[N] = X[K] . W  (W pre-quantized, output-major); quantizes X on the fly */
 static void gemv_q8(const QMat *m, const float *X, float *Y, int N, int K){
     int nb=(K+31)/32, kp=nb*32;
     if(kp>gq_cap){ gq_xq=realloc(gq_xq,kp); gq_xs=realloc(gq_xs,sizeof(float)*(size_t)nb); gq_cap=kp; }
     q8_row(X,K,gq_xq,gq_xs);
-    int par = (long)N*K >= (96L<<10);   /* only thread big GEMVs; small ones serial (no fork/join) */
-    #pragma omp parallel for schedule(static) if(par)
-    for(int n=0;n<N;n++)
-        Y[n]=qdot_row(m->q+(size_t)n*kp, m->s+(size_t)n*nb, gq_xq, gq_xs, nb);
+    GemvJob j={m,gq_xq,gq_xs,Y,nb,kp};
+    /* Dispatch is ~1 us; below ~32 KB of weights the split does not pay it back. */
+    if((long)N*K < (32L<<10)) gemv_body(&j,0,N,0);
+    else                      tl_for(N, gemv_body, &j);
 }
 /* Y[m][N] = X[m][K] . W, W pre-quantized output-major. The m>1 companion to
  * gemv_q8.
@@ -1387,17 +1633,22 @@ static void gemv_q8(const QMat *m, const float *X, float *Y, int N, int K){
  * once and the m activations stay in L1.
  *
  * Activations are quantized ONCE up front rather than per row per column. */
+typedef struct { const QMat *mq; const int8_t *xq; const float *xs; float *Y; int m,N,nb,kp; } GemmJob;
+static void gemm_body(void *p,int lo,int hi,int tid){
+    GemmJob *j=(GemmJob*)p; (void)tid;
+    for(int n=lo;n<hi;n++){
+        const int8_t *wr=j->mq->q+(size_t)n*j->kp; const float *ws=j->mq->s+(size_t)n*j->nb;
+        for(int i=0;i<j->m;i++)
+            j->Y[(size_t)i*j->N+n]=qdot_row(wr, ws, j->xq+(size_t)i*j->kp, j->xs+(size_t)i*j->nb, j->nb);
+    }
+}
 static void gemm_q8(const QMat *mq,const float *X,float *Y,int m,int N,int K){
     int nb=(K+31)/32, kp=nb*32;
     int8_t *xq=malloc((size_t)m*kp);
     float  *xs=malloc(sizeof(float)*(size_t)m*nb);
     for(int i=0;i<m;i++) q8_row(X+(size_t)i*K,K,xq+(size_t)i*kp,xs+(size_t)i*nb);
-    #pragma omp parallel for schedule(static)
-    for(int n=0;n<N;n++){
-        const int8_t *wr=mq->q+(size_t)n*kp; const float *ws=mq->s+(size_t)n*nb;
-        for(int i=0;i<m;i++)
-            Y[(size_t)i*N+n]=qdot_row(wr, ws, xq+(size_t)i*kp, xs+(size_t)i*nb, nb);
-    }
+    GemmJob j={mq,xq,xs,Y,m,N,nb,kp};
+    tl_for(N, gemm_body, &j);
     free(xq); free(xs);
 }
 /* decode matmul: int8 whenever a quantized copy exists. Previously this was
@@ -1426,8 +1677,15 @@ typedef struct {
     float *fn,*logits,*rinv,*probs;
     float *hlog,*hh,*ht;              /* single-row scratch (main/MTP heads) */
     int   *posbuf;
+    int   *moe_as; float *moe_gt,*moe_rp;    /* MoE routing scratch, allocated once:
+                                                forward_chunk used to malloc/free
+                                                three of these per layer per token */
     int    q8;                        /* int8 decode active */
-    QMat   qemb, *qwq,*qwk,*qwv,*qwo,*qw1,*qw3,*qw2,*qmtp;  /* pre-quantized weights */
+    float *qkv;                       /* fused Q|K|V output rows, [CH][D+2*KD] */
+    /* Pre-quantized decode weights. qwqkv is Q, K and V concatenated
+     * output-major, and qw13 interleaves W1 and W3 row-by-row -- see
+     * qmat_KN3 / qmat_KN_ilv. */
+    QMat   qemb, *qwqkv,*qwo,*qw13,*qw2,*qmtp;
 } Gen;
 
 /* TINYLM_PROF=1 attributes decode time to attention / matmul / MoE / lm_head.
@@ -1482,9 +1740,15 @@ static inline void axpy_f(float *restrict y, const float *restrict x, float a, i
  * reassociates the softmax and so gives up bit-exact decode. Enable with
  * TINYLM_KVSPLIT=1 on a machine with more cores than this one, where 2 jobs
  * would actually leave cores idle. */
+/* Splitting the key range is what gives the m==1 attention more than KV=2 jobs
+ * to hand out. It used to default OFF because under OpenMP the extra regions
+ * cost more than the split saved; with the decode pool it is the difference
+ * between attention running on one core and on all of them, so it now defaults
+ * ON whenever the pool is live. TINYLM_KVSPLIT=0 forces the unsplit path, which
+ * is the bit-exact one (the online merge reassociates the softmax). */
 static int kv_split_on(void){
     static int v=-1;
-    if(v<0){ const char *e=getenv("TINYLM_KVSPLIT"); v = e ? (*e!='0') : 0; }
+    if(v<0){ const char *e=getenv("TINYLM_KVSPLIT"); v = e ? (*e!='0') : (g_pool_nt>1); }
     return v;
 }
 #define KVDT_F32 0
@@ -1620,6 +1884,7 @@ static int prof_on(void){ if(g_prof<0){ const char*e=getenv("TINYLM_PROF"); g_pr
 
 static Gen *gen_new(const Cfg *c, const Weights *w, int use_q8){
     int CH=c->T;
+    tlp_init();                       /* must precede the per-thread scratch sizing */
     Gen *gn=calloc(1,sizeof(Gen));
     gn->kvdt=kv_dtype_env();
     size_t kvbytes=(size_t)c->T*c->KD*kv_elem_sz(gn->kvdt);
@@ -1636,13 +1901,18 @@ static Gen *gen_new(const Cfg *c, const Weights *w, int use_q8){
                 kv_name(gn->kvdt), 2.0*c->L*kvbytes/1e6, c->L, c->T);
     gn->x=fz((size_t)CH*c->D); gn->xn=fz((size_t)CH*c->D); gn->q=fz((size_t)CH*c->D);
     gn->k=fz((size_t)CH*c->KD); gn->v=fz((size_t)CH*c->KD); gn->ctx=fz((size_t)CH*c->D);
+    gn->qkv=fz((size_t)CH*(c->D+2*c->KD));
     gn->tmp=fz((size_t)CH*c->D); gn->g=fz((size_t)CH*c->F); gn->u=fz((size_t)CH*c->F);
     gn->fn=fz((size_t)CH*c->D); gn->logits=fz((size_t)CH*c->V); gn->rinv=fz(CH);
-    /* pb holds grp interleaved score rows per thread, so it is H*T not T */
-    gn->probs=fz((size_t)c->T*c->H*max_threads());
-    gn->accs =fz((size_t)c->H*c->hd*max_threads());
+    /* pb holds grp interleaved score rows per thread, so it is H*T not T.
+     * Sized by the POOL's thread count -- attention no longer runs under OpenMP,
+     * so omp_get_max_threads() would be both wrong and (when it is larger) waste. */
+    gn->probs=fz((size_t)c->T*c->H*g_pool_nt);
+    gn->accs =fz((size_t)c->H*c->hd*g_pool_nt);
     gn->part =fz((size_t)KV_SPLIT_MAX*c->H*(c->hd+2));
     gn->hlog=fz(c->V); gn->hh=fz(c->D); gn->ht=fz(c->D); gn->posbuf=malloc(sizeof(int)*CH);
+    gn->moe_as=malloc(sizeof(int)*CH);
+    gn->moe_gt=fz(CH); gn->moe_rp=fz((size_t)CH*(c->n_exp>0?c->n_exp:1));
     /* Pre-quantize the decode weights to int8. QKV/O + emb, the dense FFN, MTP
      * heads -- and, since this change, the MoE EXPERTS.
      *
@@ -1653,20 +1923,19 @@ static Gen *gen_new(const Cfg *c, const Weights *w, int use_q8){
         int L=c->L,D=c->D,KD=c->KD,F=c->F,V=c->V;
         int E=c->n_exp>0?c->n_exp:1;
         gn->qemb=qmat_NK(w->emb, V, D);
-        gn->qwq=malloc(sizeof(QMat)*L); gn->qwk=malloc(sizeof(QMat)*L);
-        gn->qwv=malloc(sizeof(QMat)*L); gn->qwo=malloc(sizeof(QMat)*L);
+        gn->qwqkv=malloc(sizeof(QMat)*L); gn->qwo=malloc(sizeof(QMat)*L);
         /* one QMat per (layer, expert); dense models have E==1 so the indexing
            l*E+e collapses back to l */
-        gn->qw1=malloc(sizeof(QMat)*(size_t)L*E); gn->qw3=malloc(sizeof(QMat)*(size_t)L*E);
-        gn->qw2=malloc(sizeof(QMat)*(size_t)L*E);
+        gn->qw13=malloc(sizeof(QMat)*(size_t)L*E);
+        gn->qw2 =malloc(sizeof(QMat)*(size_t)L*E);
         for(int l=0;l<L;l++){
-            gn->qwq[l]=qmat_KN(w->wq[l],D,D);  gn->qwk[l]=qmat_KN(w->wk[l],D,KD);
-            gn->qwv[l]=qmat_KN(w->wv[l],D,KD); gn->qwo[l]=qmat_KN(w->wo[l],D,D);
+            gn->qwqkv[l]=qmat_KN3(w->wq[l],w->wk[l],w->wv[l], D, D,KD,KD);
+            gn->qwo[l]  =qmat_KN(w->wo[l],D,D);
             for(int e=0;e<E;e++){
                 size_t i=(size_t)l*E+e;
-                gn->qw1[i]=qmat_KN(w->w1[l]+(size_t)e*D*F, D, F);
-                gn->qw3[i]=qmat_KN(w->w3[l]+(size_t)e*D*F, D, F);
-                gn->qw2[i]=qmat_KN(w->w2[l]+(size_t)e*F*D, F, D);
+                gn->qw13[i]=qmat_KN_ilv(w->w1[l]+(size_t)e*D*F,
+                                        w->w3[l]+(size_t)e*D*F, D, F);
+                gn->qw2[i] =qmat_KN(w->w2[l]+(size_t)e*F*D, F, D);
             }
         }
         if(c->n_mtp>0){ gn->qmtp=malloc(sizeof(QMat)*c->n_mtp);
@@ -1682,6 +1951,77 @@ static Gen *gen_new(const Cfg *c, const Weights *w, int use_q8){
  * The router stays fp32: it is D x E (512 x 16 here), i.e. 0.004% of the layer,
  * and it decides which expert every token gets, so it is the last thing worth
  * approximating. */
+/* Prefill (N>1) helpers. These are elementwise/memcpy work, but they run while
+ * the decode pool is live, so they must not open an OpenMP region -- two
+ * thread pools awake at once oversubscribe the machine. */
+typedef struct { int *assign; float *gate,*rprobs; int E; } MoeRtJob;
+static void moe_rt_body(void *p,int lo,int hi,int tid){
+    MoeRtJob *j=(MoeRtJob*)p; int E=j->E; (void)tid;
+    for(int n=lo;n<hi;n++){
+        float *r=me_rt+(size_t)n*E, *pr=j->rprobs+(size_t)n*E;
+        float mx=-1e30f; for(int e=0;e<E;e++) if(r[e]>mx)mx=r[e];
+        float s=0; for(int e=0;e<E;e++){ pr[e]=expf(r[e]-mx); s+=pr[e]; }
+        float inv=1.0f/s; int best=0; for(int e=0;e<E;e++){ pr[e]*=inv; if(pr[e]>pr[best])best=e; }
+        j->assign[n]=best; j->gate[n]=pr[best];
+    }
+}
+typedef struct { const float *fnorm; float *out; const float *gate; int D; } MoeGsJob;
+static void moe_gather_body(void *p,int lo,int hi,int tid){
+    MoeGsJob *j=(MoeGsJob*)p; int D=j->D; (void)tid;
+    for(int r=lo;r<hi;r++) memcpy(me_X+(size_t)r*D, j->fnorm+(size_t)me_idx[r]*D, sizeof(float)*D);
+}
+static void moe_scatter_body(void *p,int lo,int hi,int tid){
+    MoeGsJob *j=(MoeGsJob*)p; int D=j->D; (void)tid;
+    for(int r=lo;r<hi;r++){
+        int n=me_idx[r]; float gt=j->gate[n];
+        float *o=j->out+(size_t)n*D, *y=me_y+(size_t)r*D;
+        for(int d=0;d<D;d++) o[d]+=gt*y[d];
+    }
+}
+static void moe_silu_body(void *p,int lo,int hi,int tid){
+    int F=*(const int*)p; (void)tid;
+    for(int r=lo;r<hi;r++){
+        size_t o=(size_t)r*F;
+        for(int i=0;i<F;i++) me_a[o+i]=siluf(me_g[o+i])*me_u[o+i];
+    }
+}
+/* out[rows][F] = silu(X @ W1) * (X @ W3), straight off the interleaved [2F][D]
+ * int8 matrix. One walk of the weights, and the SwiGLU is folded into the same
+ * pass -- the separate g/u buffers and the elementwise sweep over them are gone.
+ * The activation is quantized once, not once per output column. */
+typedef struct { const QMat *q13; const int8_t *xq; const float *xs; float *out;
+                 int rows,F,nb,kp; } SwigluJob;
+static void swiglu_body(void *p,int lo,int hi,int tid){
+    SwigluJob *j=(SwigluJob*)p; (void)tid;
+    int nb=j->nb, kp=j->kp, rows=j->rows, F=j->F;
+    for(int n=lo;n<hi;n++){
+        const int8_t *r1=j->q13->q+(size_t)(2*n)*kp, *r3=r1+kp;
+        const float  *s1=j->q13->s+(size_t)(2*n)*nb, *s3=s1+nb;
+        for(int i=0;i<rows;i++){
+            const int8_t *xq=j->xq+(size_t)i*kp; const float *xs=j->xs+(size_t)i*nb;
+            float a1=qdot_row(r1,s1,xq,xs,nb), a3=qdot_row(r3,s3,xq,xs,nb);
+            j->out[(size_t)i*F+n]=siluf(a1)*a3;
+        }
+    }
+}
+static void swiglu_q8(const QMat *q13, const float *X, float *out, int rows, int D, int F){
+    int nb=(D+31)/32, kp=nb*32;
+    int8_t *xq, *lq=NULL; float *xs, *ls=NULL;
+    if(rows==1){ me_qensure(D,F); q8_row(X,D,me_xq,me_xs); xq=me_xq; xs=me_xs; }
+    else { lq=malloc((size_t)rows*kp); ls=malloc(sizeof(float)*(size_t)rows*nb);
+           for(int i=0;i<rows;i++) q8_row(X+(size_t)i*D,D,lq+(size_t)i*kp,ls+(size_t)i*nb);
+           xq=lq; xs=ls; }
+    SwigluJob j={q13,xq,xs,out,rows,F,nb,kp};
+    tl_for(F, swiglu_body, &j);
+    free(lq); free(ls);
+}
+typedef struct { const QMat *q2; const float *fin; float *out; float gt; int nbF,kpF; } MoeDnJob;
+static void moe_dn_body(void *p,int lo,int hi,int tid){
+    MoeDnJob *j=(MoeDnJob*)p; (void)tid;
+    for(int n=lo;n<hi;n++)
+        j->out[n]=j->fin[n]+j->gt*qdot_row(j->q2->q+(size_t)n*j->kpF, j->q2->s+(size_t)n*j->nbF,
+                                           me_aq, me_as, j->nbF);
+}
 static void moe_forward_q8(const Cfg *c, const Weights *w, const Gen *gn, int l,
                            const float *fnorm, const float *fin, float *out,
                            int N, int *assign, float *gate, float *rprobs){
@@ -1702,51 +2042,33 @@ static void moe_forward_q8(const Cfg *c, const Weights *w, const Gen *gn, int l,
         for(int e=0;e<E;e++){ rprobs[e]*=inv; if(rprobs[e]>rprobs[best])best=e; }
         assign[0]=best; gate[0]=rprobs[best];
         size_t qi=(size_t)l*E+best;
-        const QMat *q1=&gn->qw1[qi], *q3=&gn->qw3[qi], *q2=&gn->qw2[qi];
-        int nbD=(D+31)/32, kpD=nbD*32, nbF=(F+31)/32, kpF=nbF*32;
-        q8_row(fnorm,D,me_xq,me_xs);
-        #pragma omp parallel for schedule(static)
-        for(int n=0;n<F;n++){                    /* w1 and w3 read the SAME x row */
-            float a1=qdot_row(q1->q+(size_t)n*kpD, q1->s+(size_t)n*nbD, me_xq, me_xs, nbD);
-            float a3=qdot_row(q3->q+(size_t)n*kpD, q3->s+(size_t)n*nbD, me_xq, me_xs, nbD);
-            me_a[n]=siluf(a1)*a3;                /* fused: no second pass over F */
-        }
+        const QMat *q2=&gn->qw2[qi];
+        int nbF=(F+31)/32, kpF=nbF*32;
+        swiglu_q8(&gn->qw13[qi], fnorm, me_a, 1, D, F);
         q8_row(me_a,F,me_aq,me_as);
-        float gt=gate[0];
-        #pragma omp parallel for schedule(static)
-        for(int n=0;n<D;n++){
-            out[n]=fin[n]+gt*qdot_row(q2->q+(size_t)n*kpF, q2->s+(size_t)n*nbF, me_aq, me_as, nbF);
-        }
+        MoeDnJob dj={q2,fin,out,gate[0],nbF,kpF};
+        tl_for(D, moe_dn_body, &dj);
         return;
     }
     me_ensure(N,D,F,E);
     mm(me_rt, fnorm, w->wr[l], N, D, E);
-    #pragma omp parallel for schedule(static)
-    for(int n=0;n<N;n++){
-        float *r=me_rt+(size_t)n*E, *pr=rprobs+(size_t)n*E;
-        float mx=-1e30f; for(int e=0;e<E;e++) if(r[e]>mx)mx=r[e];
-        float s=0; for(int e=0;e<E;e++){ pr[e]=expf(r[e]-mx); s+=pr[e]; }
-        float inv=1.0f/s; int best=0; for(int e=0;e<E;e++){ pr[e]*=inv; if(pr[e]>pr[best])best=e; }
-        assign[n]=best; gate[n]=pr[best];
-    }
+    { MoeRtJob rj={assign,gate,rprobs,E};  tl_for(N, moe_rt_body, &rj); }
     memcpy(out, fin, sizeof(float)*(size_t)N*D);
     for(int e=0;e<E;e++){
         int ne=0; for(int n=0;n<N;n++) if(assign[n]==e) me_idx[ne++]=n;
         if(!ne) continue;
-        #pragma omp parallel for schedule(static)
-        for(int j=0;j<ne;j++) memcpy(me_X+(size_t)j*D, fnorm+(size_t)me_idx[j]*D, sizeof(float)*D);
+        { MoeGsJob gj={fnorm,NULL,gate,D};  tl_for(ne, moe_gather_body, &gj); }
         size_t qi=(size_t)l*E+e;
-        const float *w1=w->w1[l]+(size_t)e*D*F, *w3=w->w3[l]+(size_t)e*D*F, *w2=w->w2[l]+(size_t)e*F*D;
-        const QMat *q1 = gn->q8?&gn->qw1[qi]:NULL, *q3 = gn->q8?&gn->qw3[qi]:NULL,
-                   *q2 = gn->q8?&gn->qw2[qi]:NULL;
-        mm_dec(me_g, me_X, w1, q1, ne, D, F);
-        mm_dec(me_u, me_X, w3, q3, ne, D, F);
-        #pragma omp parallel for schedule(static)
-        for(size_t i=0;i<(size_t)ne*F;i++) me_a[i]=siluf(me_g[i])*me_u[i];
+        /* gen_drop_fp32 nulls w->w1/w3/w2 once the int8 copies exist, so the
+         * fp32 pointers may only be formed on the !q8 branch. */
+        const QMat *q2 = gn->q8?&gn->qw2[qi]:NULL;
+        const float *w2 = gn->q8?NULL:w->w2[l]+(size_t)e*F*D;
+        if(gn->q8) swiglu_q8(&gn->qw13[qi], me_X, me_a, ne, D, F);
+        else { mm(me_g, me_X, w->w1[l]+(size_t)e*D*F, ne, D, F);
+               mm(me_u, me_X, w->w3[l]+(size_t)e*D*F, ne, D, F);
+               tl_for(ne, moe_silu_body, &F); }
         mm_dec(me_y, me_a, w2, q2, ne, F, D);
-        #pragma omp parallel for schedule(static)
-        for(int j=0;j<ne;j++){ int n=me_idx[j]; float gt=gate[n]; float *o=out+(size_t)n*D, *y=me_y+(size_t)j*D;
-            for(int d=0;d<D;d++) o[d]+=gt*y[d]; }
+        { MoeGsJob sj={NULL,out,gate,D};   tl_for(ne, moe_scatter_body, &sj); }
     }
 }
 
@@ -1786,6 +2108,94 @@ static float *gen_drop_fp32(const Cfg *c, Weights *w, float **P){
     return keep;
 }
 
+/* One (row, kv-head, chunk) slice of the attention loop. Extracted from
+ * forward_chunk so the decode pool can run it: at m=1 this is the only place
+ * left with real per-token parallelism, and a libgomp region here cost more
+ * than the dots it was splitting. `tid` now comes from the pool, not
+ * omp_get_thread_num, and indexes the same per-thread probs/accs scratch. */
+typedef struct {
+    const Cfg *c; Gen *gn;
+    int l, start_pos, wlim, W, NC, KV, grp, hd, D, KD, dt, esz;
+    float scale;
+} AttnJob;
+static void attn_body(void *p, int jlo, int jhi, int tid){
+    AttnJob *aj=(AttnJob*)p;
+    const Cfg *c=aj->c; Gen *gn=aj->gn;
+    int l=aj->l, start_pos=aj->start_pos, wlim=aj->wlim, W=aj->W, NC=aj->NC;
+    int KV=aj->KV, grp=aj->grp, hd=aj->hd, D=aj->D, KD=aj->KD, dt=aj->dt, esz=aj->esz;
+    int H=c->H; float scale=aj->scale;
+    for(int job=jlo;job<jhi;job++){
+        int ck=job%NC, kvh=(job/NC)%KV, j=job/(NC*KV);
+        int pos=start_pos+j;
+        int lo = pos>=wlim ? pos-wlim+1 : 0, cnt = pos-lo+1;
+        int a=(int)(((long)cnt*ck)/NC), b=(int)(((long)cnt*(ck+1))/NC), len=b-a;
+        /* The ring range is at most two CONTIGUOUS spans; walking them
+         * directly keeps a hardware modulo out of the innermost loop and
+         * lets the prefetcher work. */
+        int s0=lo%W, r1=W-s0; if(r1>cnt) r1=cnt;
+        float *pb =gn->probs+(size_t)tid*H*W;          /* [grp][len] */
+        float *acc=gn->accs +(size_t)tid*H*hd;         /* [grp][hd]  */
+        float mxh[64], lsum[64];
+        for(int g=0;g<grp;g++){ mxh[g]=-1e30f; lsum[g]=0.0f;
+            for(int d=0;d<hd;d++) acc[(size_t)g*hd+d]=0.0f; }
+        if(len>0){
+            const char *Kb=(const char*)gn->Kc[l]+(size_t)kvh*hd*esz;
+            const char *Vb=(const char*)gn->Vc[l]+(size_t)kvh*hd*esz;
+            const float *Ks=gn->Ksc?gn->Ksc[l]:NULL, *Vs=gn->Vsc?gn->Vsc[l]:NULL;
+            double _p0=prof_on()?wtime():0.0;
+            /* pass 1: one K row -> grp scores */
+            for(int t=a;t<b;t++){
+                int slot = t<r1 ? s0+t : t-r1;
+                const void *kr=Kb+(size_t)slot*KD*esz;
+                float rs=Ks?Ks[(size_t)slot*KV+kvh]:1.0f;
+                for(int g=0;g<grp;g++){
+                    const float *qh=gn->q+(size_t)j*D+(size_t)(kvh*grp+g)*hd;
+                    float d0=kv_dot(qh,kr,hd,dt,rs)*scale;
+                    pb[(size_t)g*len+(t-a)]=d0; if(d0>mxh[g])mxh[g]=d0;
+                }
+            }
+            /* With no split, normalise BEFORE accumulating. That reproduces
+             * the pre-fusion multiply order exactly, so f32 stays bit-exact
+             * with every historical number; the split path cannot, because
+             * the merge is what reassociates. */
+            double _p1=prof_on()?wtime():0.0;
+            int xex=exact_exp_on();
+            for(int g=0;g<grp;g++){ float s=0.0f; float *r=pb+(size_t)g*len; float mg=mxh[g];
+                if(xex){ for(int t=0;t<len;t++){ r[t]=expf(r[t]-mg); s+=r[t]; } }
+                else   { for(int t=0;t<len;t++){ r[t]=fast_expf(r[t]-mg); s+=r[t]; } }
+                lsum[g]=s;
+                if(NC==1){ float inv=s>0?1.0f/s:0.0f; for(int t=0;t<len;t++) r[t]*=inv; } }
+            double _p2=prof_on()?wtime():0.0;
+            /* pass 2: one V row -> grp accumulators */
+            for(int t=a;t<b;t++){
+                int slot = t<r1 ? s0+t : t-r1;
+                const void *vr=Vb+(size_t)slot*KD*esz;
+                float rs=Vs?Vs[(size_t)slot*KV+kvh]:1.0f;
+                for(int g=0;g<grp;g++)
+                    kv_axpy(acc+(size_t)g*hd, vr, pb[(size_t)g*len+(t-a)], hd, dt, rs);
+            }
+            if(prof_on()){ double _p3=wtime();
+                #pragma omp atomic
+                g_a_dot += _p1-_p0;
+                #pragma omp atomic
+                g_a_exp += _p2-_p1;
+                #pragma omp atomic
+                g_a_acc += _p3-_p2; }
+        }
+        if(NC==1){                       /* already normalised above */
+            for(int g=0;g<grp;g++)
+                memcpy(gn->ctx+(size_t)j*D+(size_t)(kvh*grp+g)*hd,
+                       acc+(size_t)g*hd, sizeof(float)*hd);
+        } else {
+            for(int g=0;g<grp;g++){
+                float *p=gn->part+((size_t)(kvh*grp+g)*NC+ck)*(hd+2);
+                p[0]=mxh[g]; p[1]=lsum[g];
+                memcpy(p+2, acc+(size_t)g*hd, sizeof(float)*hd);
+            }
+        }
+    }
+}
+
 /* Process m tokens at positions start_pos..start_pos+m-1 through a sliding ring
  * cache. Fills gn->logits (m*V, main head) and gn->fn (m*D, final hidden). The
  * cache-write+attention step is sequential over the chunk to keep the ring valid
@@ -1798,10 +2208,24 @@ static void forward_chunk(const Cfg *c, const Weights *w, Gen *gn,
                           gn->posbuf[j]=start_pos+j; }
     for(int l=0;l<c->L;l++){
         rmsnorm_fwd(gn->x, w->an1[l], gn->xn, gn->rinv, m, D);
+        /* One fused Q|K|V GEMV, then split the rows back out. The split copies
+         * m*(D+2*KD) floats -- 3 KB at m=1, against the 655 KB of weights the
+         * fusion streams once instead of three times. */
         PT(g_t_qkv,
-        mm_dec(gn->q, gn->xn, w->wq[l], gn->q8?&gn->qwq[l]:NULL, m, D, D);
-        mm_dec(gn->k, gn->xn, w->wk[l], gn->q8?&gn->qwk[l]:NULL, m, D, KD);
-        mm_dec(gn->v, gn->xn, w->wv[l], gn->q8?&gn->qwv[l]:NULL, m, D, KD));
+        if(gn->q8){
+            int QN=D+2*KD;
+            mm_dec(gn->qkv, gn->xn, NULL, &gn->qwqkv[l], m, D, QN);
+            for(int j=0;j<m;j++){
+                const float *r=gn->qkv+(size_t)j*QN;
+                memcpy(gn->q+(size_t)j*D,  r,      sizeof(float)*D);
+                memcpy(gn->k+(size_t)j*KD, r+D,    sizeof(float)*KD);
+                memcpy(gn->v+(size_t)j*KD, r+D+KD, sizeof(float)*KD);
+            }
+        } else {
+            mm(gn->q, gn->xn, w->wq[l], m, D, D);
+            mm(gn->k, gn->xn, w->wk[l], m, D, KD);
+            mm(gn->v, gn->xn, w->wv[l], m, D, KD);
+        });
         rope_apply(gn->q, gn->posbuf, m, H,  hd, half, 0);
         rope_apply(gn->k, gn->posbuf, m, KV, hd, half, 0);
         /* The KV ring holds W=c->T entries, but a TLM5 model was TRAINED with a
@@ -1835,82 +2259,12 @@ static void forward_chunk(const Cfg *c, const Weights *w, Gen *gn,
          * merged afterwards (max/sum rescale, the standard online form). That
          * keeps >= 2 jobs per thread while still getting the reuse. Splitting is
          * only done for m==1; prefill already has m*KV jobs to hand out. */
-        int nt=max_threads(), NC=1;
+        int nt=g_pool_nt, NC=1;
         if(m==1 && KV<2*nt && kv_split_on()){
             NC=(2*nt+KV-1)/KV; if(NC>KV_SPLIT_MAX)NC=KV_SPLIT_MAX; if(NC<1)NC=1; }
         int njob=m*KV*NC;
-        #pragma omp parallel for schedule(static) if(njob>1)
-        for(int job=0;job<njob;job++){
-            int ck=job%NC, kvh=(job/NC)%KV, j=job/(NC*KV);
-            int pos=start_pos+j;
-            int lo = pos>=wlim ? pos-wlim+1 : 0, cnt = pos-lo+1;
-            int a=(int)(((long)cnt*ck)/NC), b=(int)(((long)cnt*(ck+1))/NC), len=b-a;
-            /* The ring range is at most two CONTIGUOUS spans; walking them
-             * directly keeps a hardware modulo out of the innermost loop and
-             * lets the prefetcher work. */
-            int s0=lo%W, r1=W-s0; if(r1>cnt) r1=cnt;
-            int tid=this_thread();
-            float *pb =gn->probs+(size_t)tid*H*W;          /* [grp][len] */
-            float *acc=gn->accs +(size_t)tid*H*hd;         /* [grp][hd]  */
-            float mxh[64], lsum[64];
-            for(int g=0;g<grp;g++){ mxh[g]=-1e30f; lsum[g]=0.0f;
-                for(int d=0;d<hd;d++) acc[(size_t)g*hd+d]=0.0f; }
-            if(len>0){
-                const char *Kb=(const char*)gn->Kc[l]+(size_t)kvh*hd*esz;
-                const char *Vb=(const char*)gn->Vc[l]+(size_t)kvh*hd*esz;
-                const float *Ks=gn->Ksc?gn->Ksc[l]:NULL, *Vs=gn->Vsc?gn->Vsc[l]:NULL;
-                double _p0=prof_on()?wtime():0.0;
-                /* pass 1: one K row -> grp scores */
-                for(int t=a;t<b;t++){
-                    int slot = t<r1 ? s0+t : t-r1;
-                    const void *kr=Kb+(size_t)slot*KD*esz;
-                    float rs=Ks?Ks[(size_t)slot*KV+kvh]:1.0f;
-                    for(int g=0;g<grp;g++){
-                        const float *qh=gn->q+(size_t)j*D+(size_t)(kvh*grp+g)*hd;
-                        float d0=kv_dot(qh,kr,hd,dt,rs)*scale;
-                        pb[(size_t)g*len+(t-a)]=d0; if(d0>mxh[g])mxh[g]=d0;
-                    }
-                }
-                /* With no split, normalise BEFORE accumulating. That reproduces
-                 * the pre-fusion multiply order exactly, so f32 stays bit-exact
-                 * with every historical number; the split path cannot, because
-                 * the merge is what reassociates. */
-                double _p1=prof_on()?wtime():0.0;
-                int xex=exact_exp_on();
-                for(int g=0;g<grp;g++){ float s=0.0f; float *r=pb+(size_t)g*len; float mg=mxh[g];
-                    if(xex){ for(int t=0;t<len;t++){ r[t]=expf(r[t]-mg); s+=r[t]; } }
-                    else   { for(int t=0;t<len;t++){ r[t]=fast_expf(r[t]-mg); s+=r[t]; } }
-                    lsum[g]=s;
-                    if(NC==1){ float inv=s>0?1.0f/s:0.0f; for(int t=0;t<len;t++) r[t]*=inv; } }
-                double _p2=prof_on()?wtime():0.0;
-                /* pass 2: one V row -> grp accumulators */
-                for(int t=a;t<b;t++){
-                    int slot = t<r1 ? s0+t : t-r1;
-                    const void *vr=Vb+(size_t)slot*KD*esz;
-                    float rs=Vs?Vs[(size_t)slot*KV+kvh]:1.0f;
-                    for(int g=0;g<grp;g++)
-                        kv_axpy(acc+(size_t)g*hd, vr, pb[(size_t)g*len+(t-a)], hd, dt, rs);
-                }
-                if(prof_on()){ double _p3=wtime();
-                    #pragma omp atomic
-                    g_a_dot += _p1-_p0;
-                    #pragma omp atomic
-                    g_a_exp += _p2-_p1;
-                    #pragma omp atomic
-                    g_a_acc += _p3-_p2; }
-            }
-            if(NC==1){                       /* already normalised above */
-                for(int g=0;g<grp;g++)
-                    memcpy(gn->ctx+(size_t)j*D+(size_t)(kvh*grp+g)*hd,
-                           acc+(size_t)g*hd, sizeof(float)*hd);
-            } else {
-                for(int g=0;g<grp;g++){
-                    float *p=gn->part+((size_t)(kvh*grp+g)*NC+ck)*(hd+2);
-                    p[0]=mxh[g]; p[1]=lsum[g];
-                    memcpy(p+2, acc+(size_t)g*hd, sizeof(float)*hd);
-                }
-            }
-        }
+        { AttnJob aj={c,gn,l,start_pos,wlim,W,NC,KV,grp,hd,D,KD,dt,esz,scale};
+          tl_for(njob, attn_body, &aj); }
         if(NC>1){                                       /* online softmax merge */
             for(int h=0;h<H;h++){
                 float M=-1e30f;
@@ -1932,14 +2286,14 @@ static void forward_chunk(const Cfg *c, const Weights *w, Gen *gn,
         for(size_t i=0;i<(size_t)m*D;i++) gn->x[i]+=gn->tmp[i];
         rmsnorm_fwd(gn->x, w->an2[l], gn->xn, gn->rinv, m, D);
         if(c->n_exp>0){
-            int *as=malloc(sizeof(int)*m); float *gt=malloc(sizeof(float)*m), *rp=malloc(sizeof(float)*m*c->n_exp);
-            PT(g_t_moe, moe_forward_q8(c,w,gn,l, gn->xn, gn->x, gn->tmp, m, as, gt, rp));  /* out=tmp=x+ffn */
+            PT(g_t_moe, moe_forward_q8(c,w,gn,l, gn->xn, gn->x, gn->tmp, m,
+                                       gn->moe_as, gn->moe_gt, gn->moe_rp));  /* out=tmp=x+ffn */
             memcpy(gn->x, gn->tmp, sizeof(float)*(size_t)m*D);
-            free(as); free(gt); free(rp);
         } else {
-            mm_dec(gn->g, gn->xn, w->w1[l], gn->q8?&gn->qw1[l]:NULL, m, D, F);
-            mm_dec(gn->u, gn->xn, w->w3[l], gn->q8?&gn->qw3[l]:NULL, m, D, F);
-            for(size_t i=0;i<(size_t)m*F;i++) gn->u[i]=siluf(gn->g[i])*gn->u[i];
+            if(gn->q8) swiglu_q8(&gn->qw13[l], gn->xn, gn->u, m, D, F);
+            else { mm(gn->g, gn->xn, w->w1[l], m, D, F);
+                   mm(gn->u, gn->xn, w->w3[l], m, D, F);
+                   for(size_t i=0;i<(size_t)m*F;i++) gn->u[i]=siluf(gn->g[i])*gn->u[i]; }
             mm_dec(gn->tmp, gn->u, w->w2[l], gn->q8?&gn->qw2[l]:NULL, m, F, D);
             for(size_t i=0;i<(size_t)m*D;i++) gn->x[i]+=gn->tmp[i];
         }
@@ -1962,10 +2316,45 @@ static void prof_report(double wall){
 
 static int argmax_v(const float *v, int n){ int mi=0; for(int i=1;i<n;i++) if(v[i]>v[mi])mi=i; return mi; }
 
-/* main head argmax from a single hidden row fn1 (D) */
-static int main_argmax(const Cfg *c, const Weights *w, Gen *gn, const float *fn1){
-    mmbt_dec(gn->hlog, fn1, w->emb, gn->q8?&gn->qemb:NULL, 1, c->V, c->D);
-    return argmax_v(gn->hlog, c->V);
+/* Top-k admission threshold = the k-th largest of v[0..n).
+ *
+ * The old sampler ran a k-pass selection sort over the whole vocabulary: at
+ * topk=40, V=8192 that is ~327k compares per token, plus a malloc and a memcpy
+ * of the logits, and it measured ~0.8 ms/token -- 15% of decode. A k-element
+ * min-heap does one compare against the current k-th best for the ~99.5% of
+ * entries that lose immediately, so it is a single pass and no allocation.
+ * `h` is k floats of caller scratch. Ties are admitted, exactly as before. */
+static void heap_sift(float *h, int k, int i){
+    for(;;){
+        int l=2*i+1, r=l+1, s=i;
+        if(l<k && h[l]<h[s]) s=l;
+        if(r<k && h[r]<h[s]) s=r;
+        if(s==i) return;
+        float t=h[i]; h[i]=h[s]; h[s]=t; i=s;
+    }
+}
+static float topk_thresh(const float *v, int n, int k, float *h){
+    if(k>=n) return -3.0e38f;
+    for(int i=0;i<k;i++) h[i]=v[i];
+    for(int i=k/2-1;i>=0;i--) heap_sift(h,k,i);
+    for(int i=k;i<n;i++) if(v[i]>h[0]){ h[0]=v[i]; heap_sift(h,k,0); }
+    return h[0];
+}
+/* Sample one token from raw logits. `work` is V floats of caller scratch (it
+ * doubles as the heap, which is finished with before the probabilities land in
+ * it). Arithmetically the same as the old five-pass form: exp(l/T - max(l)/T)
+ * == exp((l-max(l))/T), and the mask threshold is unchanged. */
+static int sample_logits(const Cfg *c, const float *lg, float *work, float temp, int topk){
+    int V=c->V;
+    if(topk<=1 || temp<=1e-4f) return argmax_v(lg,V);
+    float it = temp>1e-6f?temp:1e-6f;
+    float thr = (topk>0 && topk<V) ? topk_thresh(lg,V,topk,work) : -3.0e38f;
+    float mx=lg[0]; for(int i=1;i<V;i++) if(lg[i]>mx)mx=lg[i];
+    float sum=0.0f;
+    for(int i=0;i<V;i++){ float e = lg[i]>=thr ? expf((lg[i]-mx)/it) : 0.0f; work[i]=e; sum+=e; }
+    float r=rnd_uniform()*sum, ac=0.0f;
+    for(int i=0;i<V;i++){ ac+=work[i]; if(ac>=r) return i; }
+    return V-1;
 }
 /* MTP head k argmax: hk = fn1 + silu(fn1@Wk); argmax(hk @ emb^T) */
 static int mtp_argmax(const Cfg *c, const Weights *w, Gen *gn, const float *fn1, int k){
@@ -2000,17 +2389,23 @@ static void run_generation(const Cfg *c, const Weights *w, Gen *gn, const Tok *t
     if(echo_prompt){ fputs(fmt,stdout); fflush(stdout); }
 
     double w0=wtime();
-    int pos=0; float *fn_cur=NULL;
+    /* lg_cur tracks the logits row that goes with fn_cur. forward_chunk already
+     * ran the (int8) lm_head over the whole chunk; the sampler below used to
+     * throw that away and recompute the V x D head in fp32, streaming all
+     * 16.8 MB of w->emb every token. Measured at 1.09 ms/token -- 21% of decode
+     * -- for a result forward_chunk had already produced. */
+    int pos=0; float *fn_cur=NULL, *lg_cur=NULL;
     for(int i=0;i<pn;){ int m=pn-i; if(m>c->T)m=c->T; forward_chunk(c,w,gn,pids+i,m,pos);
-                        fn_cur=gn->fn+(size_t)(m-1)*c->D; pos+=m; i+=m; }
-    if(pn==0){ int z=tk->eot; forward_chunk(c,w,gn,&z,1,pos); fn_cur=gn->fn; pos=1; }
+                        fn_cur=gn->fn+(size_t)(m-1)*c->D;
+                        lg_cur=gn->logits+(size_t)(m-1)*c->V; pos+=m; i+=m; }
+    if(pn==0){ int z=tk->eot; forward_chunk(c,w,gn,&z,1,pos); fn_cur=gn->fn; lg_cur=gn->logits; pos=1; }
     free(pids);
 
     int generated=0; long acc_sum=0, fwd_chunks=0;
     if(spec){
         int K=c->n_mtp; int *draft=malloc(sizeof(int)*(K+1)); int done=0;
         while(generated<nnew && !done){
-            int x1=main_argmax(c,w,gn,fn_cur); draft[0]=x1;
+            int x1=argmax_v(lg_cur, c->V); draft[0]=x1;
             for(int k=0;k<K;k++) draft[k+1]=mtp_argmax(c,w,gn,fn_cur,k);
             forward_chunk(c,w,gn,draft,K+1,pos); fwd_chunks++;
             if(stop_eot && x1==tk->eot) done=1; else { tok_print(tk,x1); generated++; }
@@ -2021,26 +2416,18 @@ static void run_generation(const Cfg *c, const Weights *w, Gen *gn, const Tok *t
                                      else { tok_print(tk,m_r); generated++; n_acc++; } }
                 else break;
             }
-            acc_sum+=n_acc; pos+=n_acc+1; fn_cur=gn->fn+(size_t)n_acc*c->D; fflush(stdout);
+            acc_sum+=n_acc; pos+=n_acc+1; fn_cur=gn->fn+(size_t)n_acc*c->D;
+            lg_cur=gn->logits+(size_t)n_acc*c->V; fflush(stdout);
         }
         free(draft);
     } else {
         float *work=malloc(sizeof(float)*c->V);
         while(generated<nnew){
-            memset(gn->hlog,0,sizeof(float)*c->V); mm_bt(gn->hlog,fn_cur,w->emb,1,c->V,c->D);
-            float it=temp>1e-6f?temp:1e-6f;
-            for(int i=0;i<c->V;i++) work[i]=gn->hlog[i]/it;
-            if(topk>0 && topk<c->V){ float *tmp=malloc(sizeof(float)*c->V); memcpy(tmp,work,sizeof(float)*c->V);
-                for(int i=0;i<topk;i++){ int mi=i; for(int j=i+1;j<c->V;j++) if(tmp[j]>tmp[mi])mi=j;
-                    float t=tmp[i];tmp[i]=tmp[mi];tmp[mi]=t; }
-                float thr=tmp[topk-1]; for(int i=0;i<c->V;i++) if(work[i]<thr) work[i]=-1e30f; free(tmp); }
-            float mx=-1e30f; for(int i=0;i<c->V;i++) if(work[i]>mx)mx=work[i];
-            float sum=0; for(int i=0;i<c->V;i++){ work[i]=expf(work[i]-mx); sum+=work[i]; }
-            float r=rnd_uniform()*sum, ac=0; int nxt=c->V-1;
-            for(int i=0;i<c->V;i++){ ac+=work[i]; if(ac>=r){ nxt=i; break; } }
+            int nxt=sample_logits(c, lg_cur, work, temp, topk);
             if(stop_eot && nxt==tk->eot) break;
             tok_print(tk,nxt); fflush(stdout); generated++;
-            forward_chunk(c,w,gn,&nxt,1,pos); fwd_chunks++; pos++; fn_cur=gn->fn;
+            forward_chunk(c,w,gn,&nxt,1,pos); fwd_chunks++; pos++;
+            fn_cur=gn->fn; lg_cur=gn->logits;
         }
         free(work);
     }
@@ -2087,9 +2474,9 @@ static int cmd_gen(int argc, char **argv){
     Weights w; map_weights(&c,P,&w); Gen *gn=gen_new(&c,&w,use_q8);
     /* every heavy tensor now has an int8 copy -- drop the fp32 block */
     float *kept = gn->q8 ? gen_drop_fp32(&c,&w,&P) : NULL; (void)kept;
-    int nthreads=1;
+    int nthreads=g_pool_nt;
     #ifdef _OPENMP
-    nthreads=omp_get_max_threads();
+    nthreads=g_pool_nt>1?g_pool_nt:omp_get_max_threads();
     #endif
     printf("[c-tinylm gen] params=%zu threads=%d temp=%.2f topk=%d template=%s n_mtp=%d decode=%s\n",
            param_count(&c), nthreads, temp, topk, c.tmpl?"alpaca":"raw", c.n_mtp, use_q8?"int8":"fp32");
@@ -2269,26 +2656,9 @@ static int chat_stop_at(const char *s, int len, int from){
     }
     return -1;
 }
-static int chat_sample(const Cfg *c, float *hlog, float *work, float temp, int topk){
-    if(topk<=1 || temp<=1e-4f){                       /* greedy */
-        int best=0; for(int i=1;i<c->V;i++) if(hlog[i]>hlog[best]) best=i;
-        return best;
-    }
-    float it = temp>1e-6f?temp:1e-6f;
-    for(int i=0;i<c->V;i++) work[i]=hlog[i]/it;
-    if(topk>0 && topk<c->V){
-        float *tmp=malloc(sizeof(float)*c->V); memcpy(tmp,work,sizeof(float)*c->V);
-        for(int i=0;i<topk;i++){ int mi=i; for(int j=i+1;j<c->V;j++) if(tmp[j]>tmp[mi])mi=j;
-            float t=tmp[i];tmp[i]=tmp[mi];tmp[mi]=t; }
-        float thr=tmp[topk-1]; for(int i=0;i<c->V;i++) if(work[i]<thr) work[i]=-1e30f;
-        free(tmp);
-    }
-    float mx=-1e30f; for(int i=0;i<c->V;i++) if(work[i]>mx)mx=work[i];
-    float sum=0; for(int i=0;i<c->V;i++){ work[i]=expf(work[i]-mx); sum+=work[i]; }
-    float r=rnd_uniform()*sum, ac=0;
-    for(int i=0;i<c->V;i++){ ac+=work[i]; if(ac>=r) return i; }
-    return c->V-1;
-}
+/* chat_sample is now just sample_logits; kept as a name because cmd_chat reads
+ * better with it. */
+#define chat_sample(c,lg,work,temp,topk) sample_logits((c),(lg),(work),(temp),(topk))
 
 static int cmd_chat(int argc, char **argv){
     if(argc<3){ fprintf(stderr,
@@ -2316,9 +2686,9 @@ static int cmd_chat(int argc, char **argv){
     int ropemax = c.T*4;
     rope_init(&c, ropemax);
 
-    int nthreads=1;
+    int nthreads=g_pool_nt;
     #ifdef _OPENMP
-    nthreads=omp_get_max_threads();
+    nthreads=g_pool_nt>1?g_pool_nt:omp_get_max_threads();
     #endif
     printf("[tinylm chat] %s | %zu params | %s | %s | threads=%d | temp=%.2f topk=%d\n",
            path, param_count(&c),
@@ -2351,20 +2721,18 @@ static int cmd_chat(int argc, char **argv){
         else               snprintf(fmt,sizeof(fmt),"%s",line);
 
         int pn; int *pids=tok_encode(tk,fmt,&pn);
-        float *fn_cur=NULL;
+        float *lg_cur=NULL;
         for(int i=0;i<pn;){ int m=pn-i; if(m>c.T)m=c.T;
             forward_chunk(&c,&w,gn,pids+i,m,pos);
-            fn_cur=gn->fn+(size_t)(m-1)*c.D; pos+=m; i+=m; }
+            lg_cur=gn->logits+(size_t)(m-1)*c.V; pos+=m; i+=m; }
         free(pids);
-        if(!fn_cur) continue;
+        if(!lg_cur) continue;
 
         printf("bot> "); fflush(stdout);
         int rlen=0, printed=0, gen=0, cut=-1;
         double t0=wtime();
         while(gen<nmax){
-            memset(gn->hlog,0,sizeof(float)*c.V);
-            mm_bt(gn->hlog, fn_cur, w.emb, 1, c.V, c.D);
-            int nxt=chat_sample(&c, gn->hlog, work, temp, topk);
+            int nxt=chat_sample(&c, lg_cur, work, temp, topk);   /* forward_chunk already ran the head */
             if(nxt==tk->eot) break;
             int dl=tk->declen[nxt];
             if(rlen+dl >= CHAT_RESP) break;
@@ -2373,7 +2741,7 @@ static int cmd_chat(int argc, char **argv){
             if(cut>=0) break;                       /* model started a new turn */
             int safe = rlen-CHAT_HOLD;
             if(safe>printed){ fwrite(resp+printed,1,safe-printed,stdout); printed=safe; fflush(stdout); }
-            forward_chunk(&c,&w,gn,&nxt,1,pos); pos++; fn_cur=gn->fn;
+            forward_chunk(&c,&w,gn,&nxt,1,pos); pos++; lg_cur=gn->logits;
         }
         int endp = (cut>=0)?cut:rlen;               /* drop the marker and anything after */
         if(endp>printed) fwrite(resp+printed,1,endp-printed,stdout);
@@ -2547,10 +2915,18 @@ static void print_help(void){
 "   measure throughput first; the OpenBLAS build helps most on m16+.)\n"
 "\n"
 "ENVIRONMENT\n"
-"  OMP_NUM_THREADS   number of threads (default = all logical cores). On a 4-core\n"
+"  OMP_NUM_THREADS   TRAINING threads (default = all logical cores). On a 4-core\n"
 "                    /8-thread CPU, 6-8 are all within a few %%; dense GEMM slightly\n"
 "                    prefers 6 (less hyperthread contention), MoE slightly prefers\n"
 "                    8. Set OPENBLAS_NUM_THREADS to match for the BLAS build.\n"
+"  TINYLM_THREADS    DECODE threads. Generation uses its own spin-wait pool, not\n"
+"                    OpenMP: at one token per forward the regions are too small\n"
+"                    for libgomp's fork/join, which measured a NET LOSS (1 thread\n"
+"                    beat 8). Default is one fewer than the logical cores; falls\n"
+"                    back to OMP_NUM_THREADS if that is set. 1 disables the pool.\n"
+"  TINYLM_KVSPLIT    split the key range so single-token attention has more than\n"
+"                    KV jobs to hand out (default on with the pool, off without).\n"
+"                    0 forces the unsplit path, which is the bit-exact one.\n"
 "  TINYLM_NMTP       MTP/Medusa heads on a FRESH model (default 0 = off). They\n"
 "                    cost ~30%% of training at V=2048 (each adds 3 vocab-sized\n"
 "                    GEMMs in backward) and only help self-speculative decoding.\n"
@@ -2629,9 +3005,9 @@ static int cmd_bench(int argc, char **argv){
     int **tgt_mtp = c.n_mtp>0 ? malloc(sizeof(int*)*c.n_mtp) : NULL;
     for(int k=0;k<c.n_mtp;k++){ tgt_mtp[k]=malloc(sizeof(int)*N);
         for(int i=0;i<N;i++) tgt_mtp[k][i]=(int)(xorshift()%c.V); }
-    int nthreads=1;
+    int nthreads=g_pool_nt;
     #ifdef _OPENMP
-    nthreads=omp_get_max_threads();
+    nthreads=g_pool_nt>1?g_pool_nt:omp_get_max_threads();
     #endif
     printf("[bench] %s params=%.2fM D=%d L=%d H=%d KV=%d F=%d T=%d B=%d threads=%d n_mtp=%d n_exp=%d\n",
         argv[2], np/1e6, c.D,c.L,c.H,c.KV,c.F,c.T,B,nthreads,c.n_mtp,c.n_exp);

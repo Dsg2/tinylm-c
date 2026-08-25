@@ -190,12 +190,56 @@ machine below) 10k iters is roughly one overnight run.
 - **Generation:** ~1,200-1,800 tok/s (m1, B=1) with the sliding KV cache —
   single-token forwards attending to a ring buffer of the last 256 K/V; `n` can
   exceed the context without slowdown or a quality cliff.
+- **Decode, 220M/A25M int8 MoE** (12L, D=512, F=707, E=16 top-1, win=1024):
+  **120 → 669 tok/s** sustained at the full 1024-token window, interleaved A/B,
+  medians of 3. Short context: 119 → 753. See "Decode is not OpenMP" below.
+
+### Decode is not OpenMP
+
+Generation runs on its own persistent spin-wait thread pool
+(`TINYLM_THREADS`), not on OpenMP. At one token per forward every parallel
+region is a few hundred KB of work, and at that granularity libgomp is a **net
+loss**: on the 220M model, 1 thread gave 146 tok/s, 4 gave 116, 8 gave 95.
+`OMP_WAIT_POLICY`, `OMP_PROC_BIND` and `GOMP_SPINCOUNT` do not recover it.
+Worse, it cost ~30% even at one thread, because `parallel for ... if(cond)`
+with `cond` false still calls `GOMP_parallel` and builds a one-thread team —
+RMSNorm over a 512-float vector was taking 11.7 µs against ~0.2 µs of
+arithmetic.
+
+Microbenchmark, one expert's D=512 → F=707 int8 GEMV, weights drawn from a
+12×16 expert pool so nothing caches:
+
+| | 1 thread | 4 | 7 | 8 |
+|---|---|---|---|---|
+| libgomp `parallel for` | 44.5 µs | 84.5 | — | 106.7 µs |
+| spin-wait pool | 38.4 µs | 13.2 | **10.2 µs** | 10.9 |
+| pool, effective GB/s | 10.6 | 30.8 | **39.8** | 37.3 |
+
+Training keeps OpenMP — there a region is a whole batch and fork/join is
+amortised. The two are never live at once: the pool exists only between
+`gen_new` and exit, and the kernels shared with training (`mm`, `mm_bt`,
+`rmsnorm_fwd`, `rope_apply`) check for it and take the pool instead of the
+pragma.
+
+Other decode changes that came with it:
+- The sampler reads the logits `forward_chunk` already produced. It used to
+  discard them and recompute the V×D head in **fp32**, streaming all 16.8 MB of
+  the embedding every token — 21% of decode, for a result already in hand.
+- Top-k is a k-element min-heap, not a k-pass selection sort (at topk=40,
+  V=8192 that was ~327k compares plus a malloc and a memcpy per token).
+- Q, K and V are one concatenated output-major int8 matrix: one activation
+  quantization and one dispatch instead of three.
+- W1 and W3 are interleaved row-by-row, so the SwiGLU walks one contiguous
+  weight stream and fuses `silu(g)*u` into the same pass — no `g`/`u` buffers.
+
+Accuracy is unchanged: arc_easy 39.5/34.5, piqa 58.0/60.5, lambada 19.0 —
+identical to the pre-pool build on 200 items per task.
 
 ## Differences from the PyTorch version (intentional)
 | Aspect | PyTorch | C port |
 |---|---|---|
 | Autodiff | autograd | hand-written backward |
-| GEMM/attention | MKL + SDPA | naive OpenMP kernels |
+| GEMM/attention | MKL + SDPA | hand-written kernels (OpenMP to train, a spin-wait pool to decode) |
 | Dropout | 0.05 | disabled (deterministic) |
 | Generation | KV cache | sliding KV cache (ring buffer) |
 | MTP / spec decode | — | Medusa heads + self-speculative greedy decode |
