@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - 2026-09-04
+
+- `tinylm.c:2030` (sampling path) and `tinylm.c:2366` (cmd_chat) now read `gn->logits` directly instead of calling `mm_bt` to recompute the full fp32 head.
+- `tinylm.c:1967` (`main_argmax`) similarly reads `gn->logits + n_acc*V` rather than recomputing the head.
+- This eliminates the 1.09 ms/token fp32 head recomputation (21% of decode time) and is projected to yield ~+25% speedup.
+- A/B test with `bench_lm.py` is planned to verify the numerics change is safe.
+
 ## Unreleased - 2026-08-26
 
 - Replace libgomp OpenMP parallel regions on the decode path with a persistent spin-wait thread pool (`tl_for` / `tlp_*` in tinylm.c) — the pool is live only between `gen_new` and exit, training keeps OpenMP for amortised batch work. Measured 2.4x slower at 8 threads (146 → 95 tok/s) vs 3.8x faster with the pool (38.4 → 10.2 µs per GEMV call).

@@ -43,8 +43,18 @@ typedef struct {
      * full causal attention, i.e. every TLM1-4 model. full_every>0 makes every
      * Nth layer ignore the window and attend to the whole prefix. */
     int win, full_every;
+    /* TLM6/TLQ3, written by the CUDA build.
+     * n_shared: always-on experts at slots n_exp..n_exp+n_shared-1, run for
+     *   EVERY token in addition to the routed ones (DeepSeekMoE).
+     * qknorm:   RMS-normalise Q and K per head before RoPE, learned gain of
+     *   length hd shared across heads.
+     * Both consume no space when zero, so every TLM1-5 checkpoint keeps the
+     * exact layout it has always had. */
+    int n_shared, qknorm;
     float rope_base;
 } Cfg;
+/* total expert slots in a layer: routed + shared (1 == the dense FFN) */
+static int n_slots(const Cfg *c){ return c->n_exp>0 ? c->n_exp + c->n_shared : 1; }
 
 /* Effective window for layer l: 0 means "attend to the whole prefix".
  * MUST match the GPU backend's lwin() exactly or the two diverge silently. */
@@ -305,22 +315,36 @@ static void model_path(const char *name, char *buf, size_t n){
 
 /* ----------------------------- weights ---------------------------------- */
 /* All linear weights stored row-major [in][out] so Y=X@W is the plain mm. */
+/* N-gram head (bigram table for lexical prediction) */
+typedef struct {
+    int R, De, order, group, ngrp;   /* rows, embed dim, 2=bigram, group size, ngroups */
+    float *Wng;                      /* projection De*D */
+    signed char *d;                  /* q4 digits (packed into (nt+1)/2 bytes); NULL when streaming */
+    float *s;                        /* per-group scales */
+    float sref;                      /* reference scale */
+    FILE *fs;                        /* open handle to .opt.ng when streaming digits from disk */
+    long long doff;                  /* byte offset of the digit block within the file */
+} Ng;
+
 typedef struct {
     float *emb;                              /* V*D (tied with lm_head)      */
     float **an1, **wq, **wk, **wv, **wo;     /* per layer                    */
     float **an2, **w1, **w3, **w2;
+    float **qn, **kn;                        /* QK-norm gains, hd each (NULL if off) */
     float *nf;                               /* final norm gain  D           */
     float **mtp;                             /* n_mtp Medusa heads, each D*D */
     float **wr;                              /* MoE router per layer, D*n_exp (NULL if dense) */
+    Ng ng;                                   /* n-gram bigram head (inference only) */
 } Weights;
 
 static size_t param_count(const Cfg *c){
-    int E = c->n_exp>0 ? c->n_exp : 1;         /* expert count (dense = 1) */
+    int E = n_slots(c);                        /* routed + shared (dense = 1) */
     size_t per = (size_t)c->D                 /* an1 */
         + (size_t)c->D*c->D                   /* wq  */
         + (size_t)c->D*c->KD                  /* wk  */
         + (size_t)c->D*c->KD                  /* wv  */
         + (size_t)c->D*c->D                   /* wo  */
+        + (c->qknorm ? 2*(size_t)c->hd : 0)   /* qn, kn */
         + (size_t)c->D                        /* an2 */
         + (c->n_exp>0 ? (size_t)c->D*c->n_exp : 0)   /* router */
         + (size_t)E*(2*(size_t)c->D*c->F + (size_t)c->F*c->D); /* E expert FFNs (w1,w3,w2) */
@@ -335,7 +359,8 @@ static void map_weights(const Cfg *c, float *base, Weights *w){
     w->wo =malloc(sizeof(float*)*c->L); w->an2=malloc(sizeof(float*)*c->L);
     w->w1 =malloc(sizeof(float*)*c->L); w->w3=malloc(sizeof(float*)*c->L);
     w->w2 =malloc(sizeof(float*)*c->L); w->wr=malloc(sizeof(float*)*c->L);
-    int E = c->n_exp>0 ? c->n_exp : 1;
+    w->qn =malloc(sizeof(float*)*c->L); w->kn=malloc(sizeof(float*)*c->L);
+    int E = n_slots(c);
     float *p = base;
     w->emb = p; p += (size_t)c->V*c->D;
     for (int l=0;l<c->L;l++){
@@ -344,6 +369,11 @@ static void map_weights(const Cfg *c, float *base, Weights *w){
         w->wk[l]=p;  p+=(size_t)c->D*c->KD;
         w->wv[l]=p;  p+=(size_t)c->D*c->KD;
         w->wo[l]=p;  p+=(size_t)c->D*c->D;
+        /* qn/kn sit between wo and an2 and take no space when qknorm is off --
+         * matching cudalm's calc_offsets exactly. Get this wrong and every
+         * weight after it shifts, which reads as garbage rather than an error. */
+        if(c->qknorm){ w->qn[l]=p; p+=c->hd; w->kn[l]=p; p+=c->hd; }
+        else { w->qn[l]=NULL; w->kn[l]=NULL; }
         w->an2[l]=p; p+=c->D;
         if(c->n_exp>0){ w->wr[l]=p; p+=(size_t)c->D*c->n_exp; } else w->wr[l]=NULL;
         w->w1[l]=p;  p+=(size_t)E*c->D*c->F;   /* E experts, contiguous: expert e at w1[l]+e*D*F */
@@ -362,7 +392,7 @@ static void init_params(const Cfg *c, Weights *w){
     size_t emb_n=(size_t)c->V*c->D;
     for(size_t i=0;i<emb_n;i++) w->emb[i]=0.02f*rnd_normal();
     float scaled = 0.02f/sqrtf(2.0f*c->L);
-    int E = c->n_exp>0 ? c->n_exp : 1;
+    int E = n_slots(c);
     for(int l=0;l<c->L;l++){
         for(int i=0;i<c->D;i++){ w->an1[l][i]=1.0f; w->an2[l][i]=1.0f; }
         size_t dd=(size_t)c->D*c->D, dkd=(size_t)c->D*c->KD;
@@ -371,6 +401,7 @@ static void init_params(const Cfg *c, Weights *w){
         for(size_t i=0;i<dkd;i++) w->wk[l][i]=0.02f*rnd_normal();
         for(size_t i=0;i<dkd;i++) w->wv[l][i]=0.02f*rnd_normal();
         for(size_t i=0;i<dd;i++)  w->wo[l][i]=scaled*rnd_normal();   /* residual proj */
+        if(c->qknorm) for(int i=0;i<c->hd;i++){ w->qn[l][i]=1.0f; w->kn[l][i]=1.0f; }
         for(size_t i=0;i<edfn;i++) w->w1[l][i]=0.02f*rnd_normal();   /* E experts */
         for(size_t i=0;i<edfn;i++) w->w3[l][i]=0.02f*rnd_normal();
         for(size_t i=0;i<efd;i++)  w->w2[l][i]=scaled*rnd_normal();  /* residual proj */
@@ -548,6 +579,24 @@ static void rmsnorm_bwd(const float *x, const float *g, const float *rinv,
         #pragma omp critical
         { for(int i=0;i<D;i++) dg[i]+=dg_local[i]; }
         free(dg_local);
+    }
+}
+
+/* --------------------------- QK-norm ------------------------------------
+ * RMS-normalise each head's hd-vector in place and apply a learned gain of
+ * length hd shared across heads, before RoPE. A head's values are contiguous
+ * inside a [rows, nheads*hd] buffer, so this is exactly cudalm's k_rmsnorm
+ * invoked with rows*nheads rows of width hd -- same eps (1e-5 on the mean
+ * square), same order of operations. Any divergence here is a silent
+ * train/inference mismatch, not a crash. */
+static void qknorm_apply(float *buf, const float *gain, int rows, int nheads, int hd){
+    int R = rows*nheads;
+    #pragma omp parallel for schedule(static)
+    for(int r=0;r<R;r++){
+        float *v = buf + (size_t)r*hd;
+        float ss=0; for(int i=0;i<hd;i++) ss += v[i]*v[i];
+        float s = 1.0f/sqrtf(ss/hd + 1e-5f);
+        for(int i=0;i<hd;i++) v[i] = v[i]*s*gain[i];
     }
 }
 
@@ -731,7 +780,26 @@ static void attn_bwd(const Cfg *c, Acts *a, int l){
 /* ----------------------------- forward ---------------------------------- */
 static inline float siluf(float z){ return z/(1.0f+expf(-z)); }
 
-/* ----------------------------- MoE (top-1) ------------------------------ */
+/* ------------------------------ MoE (top-K) ----------------------------- */
+/* Experts routed per token. K is NOT stored in the checkpoint (cudalm reads it
+ * from CUDALM_TOPK at train time and never serializes it), so inference must be
+ * told the same value the model was trained with. Default 1; the served TLM4
+ * checkpoint was trained CUDALM_TOPK=2, so set that env to reproduce it. */
+static int g_moe_topk=0;   /* 0 = unresolved */
+static int moe_topk(int E){
+    if(!g_moe_topk){ const char *s=getenv("CUDALM_TOPK"); int k=s?atoi(s):1; g_moe_topk=k<1?1:k; }
+    int k=g_moe_topk; return k>E?E:k;
+}
+/* Index of the k-th largest prob (k=0 = max), ties broken by lowest index --
+ * matches cudalm's strict-greater argmax-with-masking in k_router_topk. */
+static inline int moe_kth(const float *pr, int E, int k){
+    for(int e=0;e<E;e++){
+        float v=pr[e]; int rank=0;
+        for(int e2=0;e2<E;e2++) if(pr[e2]>v || (pr[e2]==v && e2<e)) rank++;
+        if(rank==k) return e;
+    }
+    return 0;
+}
 /* Shared scratch for the gather/scatter expert GEMMs (grows as needed). */
 static float *me_X,*me_g,*me_u,*me_a,*me_y,*me_dy,*me_da,*me_dg,*me_du,*me_dX,*me_rt,*me_drt;
 static int *me_idx; static size_t me_cap=0;
@@ -755,11 +823,15 @@ static void me_ensure(int N,int D,int F,int E){
 }
 #define MOE_AUX 0.01f   /* load-balance aux-loss weight */
 
-/* MoE FFN: out[n] = fin[n] + gate[n]*Expert_{argmax}(fnorm[n]). Writes routing
- * (assign,gate,rprobs) for the backward (pass scratch if you don't need them). */
+/* MoE FFN: out[n] = fin[n] + sum_{k<K} pr[e_k]*Expert_{e_k}(fnorm[n]), where
+ * e_0..e_{K-1} are the K highest-prob experts and pr is the softmax over ALL E
+ * (no top-K renormalization -- gates stay the raw normalized probs, matching
+ * cudalm). Writes routing (assign,gate,rprobs) for the backward; assign/gate
+ * hold the LAST slot on return, so backward is only exact for K==1 (the
+ * training default -- this model is trained on cudalm, not here). */
 static void moe_forward(const Cfg *c, const Weights *w, int l, const float *fnorm,
                         const float *fin, float *out, int N, int *assign, float *gate, float *rprobs){
-    int D=c->D,F=c->F,E=c->n_exp;
+    int D=c->D,F=c->F,E=c->n_exp, K=moe_topk(E);
     me_ensure(N,D,F,E);
     mm(me_rt, fnorm, w->wr[l], N, D, E);                 /* router logits [N,E] */
     #pragma omp parallel for schedule(static)
@@ -767,24 +839,28 @@ static void moe_forward(const Cfg *c, const Weights *w, int l, const float *fnor
         float *r=me_rt+(size_t)n*E, *pr=rprobs+(size_t)n*E;
         float mx=-1e30f; for(int e=0;e<E;e++) if(r[e]>mx)mx=r[e];
         float s=0; for(int e=0;e<E;e++){ pr[e]=expf(r[e]-mx); s+=pr[e]; }
-        float inv=1.0f/s; int best=0; for(int e=0;e<E;e++){ pr[e]*=inv; if(pr[e]>pr[best])best=e; }
-        assign[n]=best; gate[n]=pr[best];
+        float inv=1.0f/s; for(int e=0;e<E;e++) pr[e]*=inv;
     }
     memcpy(out, fin, sizeof(float)*(size_t)N*D);          /* residual */
-    for(int e=0;e<E;e++){
-        int ne=0; for(int n=0;n<N;n++) if(assign[n]==e) me_idx[ne++]=n;   /* serial index build (cheap) */
-        if(!ne) continue;
+    for(int k=0;k<K;k++){
         #pragma omp parallel for schedule(static)
-        for(int j=0;j<ne;j++) memcpy(me_X+(size_t)j*D, fnorm+(size_t)me_idx[j]*D, sizeof(float)*D);
-        const float *w1=w->w1[l]+(size_t)e*D*F, *w3=w->w3[l]+(size_t)e*D*F, *w2=w->w2[l]+(size_t)e*F*D;
-        mm(me_g, me_X, w1, ne, D, F);
-        mm(me_u, me_X, w3, ne, D, F);
-        #pragma omp parallel for schedule(static)
-        for(size_t i=0;i<(size_t)ne*F;i++) me_a[i]=siluf(me_g[i])*me_u[i];
-        mm(me_y, me_a, w2, ne, F, D);
-        #pragma omp parallel for schedule(static)
-        for(int j=0;j<ne;j++){ int n=me_idx[j]; float gt=gate[n]; float *o=out+(size_t)n*D, *y=me_y+(size_t)j*D;
-            for(int d=0;d<D;d++) o[d]+=gt*y[d]; }
+        for(int n=0;n<N;n++){ int sel=moe_kth(rprobs+(size_t)n*E,E,k);
+            assign[n]=sel; gate[n]=rprobs[(size_t)n*E+sel]; }
+        for(int e=0;e<E;e++){
+            int ne=0; for(int n=0;n<N;n++) if(assign[n]==e) me_idx[ne++]=n;   /* serial index build (cheap) */
+            if(!ne) continue;
+            #pragma omp parallel for schedule(static)
+            for(int j=0;j<ne;j++) memcpy(me_X+(size_t)j*D, fnorm+(size_t)me_idx[j]*D, sizeof(float)*D);
+            const float *w1=w->w1[l]+(size_t)e*D*F, *w3=w->w3[l]+(size_t)e*D*F, *w2=w->w2[l]+(size_t)e*F*D;
+            mm(me_g, me_X, w1, ne, D, F);
+            mm(me_u, me_X, w3, ne, D, F);
+            #pragma omp parallel for schedule(static)
+            for(size_t i=0;i<(size_t)ne*F;i++) me_a[i]=siluf(me_g[i])*me_u[i];
+            mm(me_y, me_a, w2, ne, F, D);
+            #pragma omp parallel for schedule(static)
+            for(int j=0;j<ne;j++){ int n=me_idx[j]; float gt=gate[n]; float *o=out+(size_t)n*D, *y=me_y+(size_t)j*D;
+                for(int d=0;d<D;d++) o[d]+=gt*y[d]; }
+        }
     }
 }
 
@@ -844,6 +920,25 @@ static void moe_backward(const Cfg *c, const Weights *w, Weights *gr, int l, con
     free(d_gate); free(cnt);
 }
 /* fills acts; if targets!=NULL also computes probs+loss (returns mean loss) */
+/* QLM_ACT8: per-token int8 fake-quant of the matmul inputs (BitNet-a8 style).
+ * Rounds in place and keeps fp32 arithmetic, so it measures the QUALITY cost of
+ * int8 activations without needing an int8 GEMM. Backward is straight-through:
+ * the gradient of round() is taken as 1, which is why no backward change is
+ * needed. Covers the inputs to wq/wk/wv (a_norm), w1/w3 (f_norm) and w2 (the
+ * SwiGLU product); wo's input (att_ctx) is left alone because attn_bwd reads it.
+ */
+static int g_act8 = 0;
+static void qlm_act8(float *X, int rows, int cols){
+    #pragma omp parallel for schedule(static)
+    for(int n=0;n<rows;n++){
+        float *x=X+(size_t)n*cols, m=0.0f;
+        for(int i=0;i<cols;i++){ float t=fabsf(x[i]); if(t>m)m=t; }
+        if(!(m>0.0f)) continue;
+        float sc=m/127.0f, inv=1.0f/sc;
+        for(int i=0;i<cols;i++) x[i]=sc*(float)((int)lrintf(x[i]*inv));
+    }
+}
+
 static float forward(const Cfg *c, const Weights *w, Acts *a,
                      const int *tok, const int *targets){
     int N=a->N, D=c->D, F=c->F, KD=c->KD, V=c->V, T=c->T;
@@ -856,9 +951,14 @@ static float forward(const Cfg *c, const Weights *w, Acts *a,
     for(int l=0;l<c->L;l++){
         float *xin = a->a_in[l];
         rmsnorm_fwd(xin, w->an1[l], a->a_norm[l], a->a_rinv[l], N, D);
+        if(g_act8) qlm_act8(a->a_norm[l], N, D);
         mm(a->q[l], a->a_norm[l], w->wq[l], N, D, D);
         mm(a->k[l], a->a_norm[l], w->wk[l], N, D, KD);
         mm(a->v[l], a->a_norm[l], w->wv[l], N, D, KD);
+        if(c->qknorm){
+            qknorm_apply(a->q[l], w->qn[l], N, c->H,  c->hd);
+            qknorm_apply(a->k[l], w->kn[l], N, c->KV, c->hd);
+        }
         rope_apply(a->q[l], a->pos, N, c->H,  c->hd, c->half, 0);
         rope_apply(a->k[l], a->pos, N, c->KV, c->hd, c->half, 0);
         attn_fwd(c, a, l);
@@ -868,6 +968,7 @@ static float forward(const Cfg *c, const Weights *w, Acts *a,
         #pragma omp parallel for schedule(static)
         for(size_t i=0;i<(size_t)N*D;i++) attn_proj[i]+=xin[i];
         rmsnorm_fwd(a->f_in[l], w->an2[l], a->f_norm[l], a->f_rinv[l], N, D);
+        if(g_act8) qlm_act8(a->f_norm[l], N, D);
         float *out = (l+1<c->L)? a->a_in[l+1] : a->x_final;
         if(c->n_exp>0){
             moe_forward(c,w,l, a->f_norm[l], a->f_in[l], out, N, a->assign[l], a->gate[l], a->rprobs[l]);
@@ -877,6 +978,7 @@ static float forward(const Cfg *c, const Weights *w, Acts *a,
             float *act=a->dact;
             #pragma omp parallel for schedule(static)
             for(size_t i=0;i<(size_t)N*F;i++) act[i]=siluf(a->g[l][i])*a->u[l][i];
+            if(g_act8) qlm_act8(act, N, F);
             mm(out, act, w->w2[l], N, F, D);
             #pragma omp parallel for schedule(static)
             for(size_t i=0;i<(size_t)N*D;i++) out[i]+=a->f_in[l][i];
@@ -971,6 +1073,7 @@ static void backward(const Cfg *c, const Weights *w, Weights *gr, Acts *a,
             float *acttmp=a->du;
             #pragma omp parallel for schedule(static)
             for(size_t i=0;i<(size_t)N*F;i++) acttmp[i]=siluf(a->g[l][i])*a->u[l][i];
+            if(g_act8) qlm_act8(acttmp, N, F);
             mm_atb(gr->w2[l], acttmp, a->dout, N, F, D);       /* dW2 += act^T@dout */
             memset(a->dact,0,sizeof(float)*(size_t)N*F);
             mm_bt(a->dact, a->dout, w->w2[l], N, F, D);        /* d_act */
@@ -1046,6 +1149,418 @@ static float global_gradnorm(const float *G, size_t n){
     return (float)sqrt(s);
 }
 
+/* ===================== qlm: all-integer training ========================= *
+ * Experimental training method (see qlm-plan.md). For every 2D weight matrix
+ * (wq/wk/wv/wo and every expert w1/w3/w2) the ONLY persistent state is integer:
+ *
+ *   d[i]  int8 in [-dmax,+dmax]   the weight digit  (dmax 1 = ternary, 7 = 4-bit)
+ *   r[i]  int8 in [-64,+64]       sub-digit residual -- an error-feedback
+ *                                 accumulator, so updates smaller than one digit
+ *                                 are not lost to rounding. This is the job fp32
+ *                                 master weights normally do, in 1 byte not 4.
+ *   s[g]  fp32                    one scale per group of QLM_GROUP elements
+ *
+ * The float weight the forward pass sees is the HARD quantization w = s*d
+ * (i.e. a genuinely 2-4 bit model, deployable as-is). The residual is latent
+ * only. Straight-through estimation means the gradient wrt the latent equals
+ * the gradient wrt w, so backward() is untouched -- this is a training-method
+ * change, not an architecture change.
+ *
+ * The update is Integer Lion: Lion's output is sign(.), already an integer, so
+ * a step is a plain integer increment of r and no gradient scale is ever needed
+ * (which is what makes Adam impossible here and Lion natural).
+ *
+ * P (the flat fp32 parameter buffer) is a RENDERED VIEW of (d,r,s) for these
+ * spans -- rewritten from the digits after every step, never itself updated.
+ * On this CPU trial it is still allocated; on the GPU it would not be, which is
+ * where the 7x memory saving comes from. `qlm footprint` reports both numbers.
+ */
+
+typedef struct { size_t off, n; } QSpan;      /* span of the flat P buffer */
+typedef struct { size_t qi, pof; int n, sp; } QGrp;  /* one scale group     */
+
+typedef struct {
+    int on, dither, dmax, group, mombits, lrmode, servo_every;
+    float fstar, f_hi, f_lo;
+    int    nqs, nfs;
+    QSpan *qs, *fs;          /* quantized spans; float spans (the complement) */
+    size_t nq, nf, np, ngrp;
+    QGrp  *g;
+    int8_t *d, *r;
+    float  *s, *sref;        /* sref: per-span reference scale, frozen at init */
+    int8_t *m8; float *m8s;  /* int8 momentum (mombits==8); else M is used     */
+    int    adam;             /* 1 = Integer AdamW instead of Integer Lion      */
+    uint8_t *v8; float *v8s; /* int8 second moment, stored as sqrt(v)          */
+    long long n_carry, n_sat, n_dead, n_servo_up, n_servo_dn;
+    double sum_absr;
+} Qlm;
+
+static double g_max_sec = 0.0;   /* TINYLM_MAX_SECONDS: wall-clock training cap */
+static int    g_qadam = 0;       /* QLM_OPT=qadam: Integer AdamW, not Integer Lion */
+static Qlm  g_qlm;
+static Qlm *g_q = NULL;          /* NULL => stock AdamW path, bit-for-bit */
+static int  g_opt_lion = 0;      /* fp32 Lion on everything (the middle rung) */
+static float g_wd_over = -1.0f;
+
+static inline uint32_t qhash(uint64_t x){
+    x += 0x9E3779B97F4A7C15ULL; x ^= x>>30; x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x>>27; x *= 0x94D049BB133111EBULL; x ^= x>>31; return (uint32_t)x;
+}
+/* Stochastic rounding: floor(v), plus 1 with probability frac(v). Keyed on
+ * (index, step) rather than a global RNG so it is thread-safe under OpenMP AND
+ * reproducible across runs -- which is what makes the A/B protocol meaningful. */
+static inline int qsr(float v, uint64_t i, uint64_t t){
+    float f = floorf(v);
+    uint32_t h = qhash(i*0x2545F4914F6CDD1DULL + t*0x9E3779B97F4A7C15ULL);
+    return (int)f + (((h>>8)*(1.0f/16777216.0f) < (v-f)) ? 1 : 0);
+}
+static inline int qclampi(int v, int lo, int hi){ return v<lo?lo:(v>hi?hi:v); }
+
+/* quantize one group of floats into (d,r) at scale sg */
+static void qgrp_encode(const float *W, int n, float sg, int dmax, int8_t *d, int8_t *r){
+    float inv = 1.0f/sg;
+    for(int j=0;j<n;j++){
+        float t = W[j]*inv;
+        int dd = qclampi((int)lrintf(t), -dmax, dmax);
+        int rr = qclampi((int)lrintf((t-(float)dd)*128.0f), -64, 64);
+        d[j]=(int8_t)dd; r[j]=(int8_t)rr;
+    }
+}
+/* scale for a group: absmean for ternary (BitNet b1.58), absmax/dmax above it */
+static float qgrp_scale(const float *W, int n, int dmax){
+    double amax=0, asum=0;
+    for(int j=0;j<n;j++){ double a=fabs((double)W[j]); if(a>amax)amax=a; asum+=a; }
+    float sg = (dmax==1) ? (float)(asum/n) : (float)(amax/dmax);
+    if(!(sg>0)) sg=1e-8f;
+    return sg;
+}
+
+static void qspan_add(Qlm *q, ptrdiff_t off, size_t n){
+    q->qs[q->nqs].off=(size_t)off; q->qs[q->nqs].n=n; q->nqs++;
+}
+
+/* Build the span table, quantize P in place, and freeze the per-span reference
+ * scale used by the `rel` LR mode. Returns 0 if qlm is not enabled. */
+static int qlm_init(Qlm *q, const Cfg *c, const Weights *w, float *P, size_t np){
+    memset(q,0,sizeof(*q));
+    const char *e;
+    /* read the mode HERE: the memset above clears anything the caller set, and
+     * the second-moment buffer is sized below, so a flag assigned afterwards
+     * arrives too late and leaves v8 NULL (segfault on the first step). */
+    { const char *o=getenv("QLM_OPT"); q->adam = (o && !strcmp(o,"qadam")); }
+    int bits = (e=getenv("QLM_BITS")) ? atoi(e) : 4;
+    q->dmax  = bits<=2?1 : bits==3?3 : bits==4?7 : 127;
+    q->group = (e=getenv("QLM_GROUP")) ? atoi(e) : 128;
+    if(q->group<16) q->group=16; if(q->group>512) q->group=512;
+    q->mombits = (e=getenv("QLM_MOM")) ? atoi(e) : 32;
+    if(q->mombits!=8) q->mombits=32;
+    q->lrmode  = (e=getenv("QLM_LRMODE")) ? (!strcmp(e,"abs")?1:0) : 0;
+    q->dither  = (e=getenv("QLM_DITHER")) ? atoi(e) : 0;
+    q->servo_every = (e=getenv("QLM_SERVO")) ? atoi(e) : 100;
+    /* Target rail fraction. For 4-bit an absmax-ish scale rails ~2% of a
+     * Gaussian; for ternary the rail IS the normal state (absmean ternary puts
+     * roughly 2/3 of weights at +-1), so a single constant here would drive the
+     * servo the wrong way at dmax=1. */
+    /* Init uses absmax/dmax, which rails exactly one element per group, so the
+     * target has to be ~1/group or the servo shrinks every scale on its first
+     * tick (observed: 808 of 1440 groups scaled down at once). Ternary is the
+     * exception -- there the rail IS the normal state. */
+    q->fstar = (e=getenv("QLM_FSTAR")) ? (float)atof(e)
+             : (q->dmax==1 ? 0.60f : 1.5f/(float)q->group);
+    q->f_hi = q->fstar*1.5f; q->f_lo = q->fstar*0.5f;
+
+    int E = n_slots(c);
+    q->qs = malloc(sizeof(QSpan)*(size_t)c->L*7);
+    for(int l=0;l<c->L;l++){
+        qspan_add(q, w->wq[l]-P, (size_t)c->D*c->D);
+        qspan_add(q, w->wk[l]-P, (size_t)c->D*c->KD);
+        qspan_add(q, w->wv[l]-P, (size_t)c->D*c->KD);
+        qspan_add(q, w->wo[l]-P, (size_t)c->D*c->D);
+        qspan_add(q, w->w1[l]-P, (size_t)E*c->D*c->F);
+        qspan_add(q, w->w3[l]-P, (size_t)E*c->D*c->F);
+        qspan_add(q, w->w2[l]-P, (size_t)E*c->F*c->D);
+    }
+    /* spans come out of map_weights in ascending order; the float spans are the
+     * gaps (embeddings, both norms, the router, the final norm, MTP heads) */
+    q->np = np;
+    q->fs = malloc(sizeof(QSpan)*(q->nqs+2));
+    size_t cur=0;
+    for(int i=0;i<q->nqs;i++){
+        if(q->qs[i].off>cur){ q->fs[q->nfs].off=cur; q->fs[q->nfs].n=q->qs[i].off-cur; q->nfs++; }
+        cur = q->qs[i].off + q->qs[i].n;
+        q->nq += q->qs[i].n;
+    }
+    if(cur<np){ q->fs[q->nfs].off=cur; q->fs[q->nfs].n=np-cur; q->nfs++; }
+    for(int i=0;i<q->nfs;i++) q->nf += q->fs[i].n;
+
+    for(int i=0;i<q->nqs;i++) q->ngrp += (q->qs[i].n + q->group - 1)/q->group;
+    q->g    = malloc(sizeof(QGrp)*q->ngrp);
+    q->d    = malloc(q->nq); q->r = malloc(q->nq);
+    q->s    = malloc(sizeof(float)*q->ngrp);
+    q->sref = malloc(sizeof(float)*q->nqs);
+    if(q->mombits==8){ q->m8=calloc(q->nq,1); q->m8s=calloc(q->ngrp,sizeof(float));
+        if(q->adam){ q->v8=calloc(q->nq,1); q->v8s=calloc(q->ngrp,sizeof(float)); } }
+
+    size_t qi=0, gi=0;
+    for(int i=0;i<q->nqs;i++){
+        double ssum=0; size_t g0=gi;
+        for(size_t o=0;o<q->qs[i].n;o+=q->group){
+            int n = (int)((q->qs[i].n-o < (size_t)q->group) ? q->qs[i].n-o : (size_t)q->group);
+            q->g[gi].qi=qi; q->g[gi].pof=q->qs[i].off+o; q->g[gi].n=n; q->g[gi].sp=i;
+            float sg = qgrp_scale(P+q->g[gi].pof, n, q->dmax);
+            q->s[gi]=sg; ssum+=sg;
+            qgrp_encode(P+q->g[gi].pof, n, sg, q->dmax, q->d+qi, q->r+qi);
+            qi+=n; gi++;
+        }
+        q->sref[i] = (float)(ssum/(double)(gi-g0));
+    }
+    q->on=1;
+    return 1;
+}
+
+/* rewrite the quantized spans of P from the digits. This is the only way P is
+ * ever written for those spans -- it is a view, not a master copy. */
+static void qlm_render(const Qlm *q, float *P){
+    #pragma omp parallel for schedule(static)
+    for(long long gi=0; gi<(long long)q->ngrp; gi++){
+        const QGrp *g=&q->g[gi]; float sg=q->s[gi];
+        if(q->dither) for(int j=0;j<g->n;j++)
+            P[g->pof+j] = sg*((float)q->d[g->qi+j] + (float)q->r[g->qi+j]*(1.0f/128.0f));
+        else for(int j=0;j<g->n;j++)
+            P[g->pof+j] = sg*(float)q->d[g->qi+j];
+    }
+}
+
+/* plain fp32 Lion over a span (used for the un-quantized parameters, and for
+ * the whole model in QLM_OPT=lion). M is the existing AdamW momentum buffer. */
+static void lion_span(float *P, const float *G, float *M, size_t off, size_t n,
+                      float lr, float b1, float b2, float wd, float gscale){
+    #pragma omp parallel for schedule(static)
+    for(long long i=0;i<(long long)n;i++){
+        size_t k=off+(size_t)i;
+        float g=G[k]*gscale;
+        float cc=b1*M[k]+(1.0f-b1)*g;
+        float u = cc>0.0f?1.0f:(cc<0.0f?-1.0f:0.0f);
+        P[k] -= lr*(u + wd*P[k]);
+        M[k] = b2*M[k]+(1.0f-b2)*g;
+    }
+}
+
+/* Integer Lion over the quantized spans + render. */
+/* One element of the update. Written as a macro so ADAM and MOM8 arrive as
+ * compile-time constants: previously both were branches on `q->` fields INSIDE
+ * the inner loop, which alone stops any vectorizer. Everything else here exists
+ * to keep the loop a straight-line, unit-stride body:
+ *   - the carry `while` loops become a single branchless correction, which is
+ *     exact because idl is clamped to +-64 so |rr| <= 128 and one carry always
+ *     suffices (rr=128 -> c=1 -> rr=0; rr=64 -> c=0, matching `while(rr>64)`)
+ *   - ONE sqrt instead of two: sqrt(vv/bc2) == sqrt(vv) * (1/sqrt(bc2)), and
+ *     sqrt(vv) is needed anyway to store the second moment in the sqrt domain
+ *   - the bias-correction divides become multiplies by hoisted reciprocals
+ *   - `dither` and the momentum scales are hoisted out of the loop
+ * Stats accumulate as integers (|rr| <= 64, so the sum is exact). */
+#define QLM_BODY(ADAM, MOM8)                                                    \
+    for(int j=0;j<n;j++){                                                       \
+        size_t qi=qi0+(size_t)j, k=pof+(size_t)j;                               \
+        float gr=G[k]*gscale;                                                   \
+        float mv = MOM8 ? (float)m8[qi]*ms_old : M[k];                          \
+        float u, mn;                                                            \
+        if(ADAM){                                                               \
+            float vv;                                                           \
+            if(MOM8){ float sv=(float)v8[qi]*vs_old; vv=sv*sv; }                \
+            else      vv=Vv[k];                                                 \
+            mn = b1*mv + (1.0f-b1)*gr;                                          \
+            vv = b2*vv + (1.0f-b2)*gr*gr;                                       \
+            float rv = sqrtf(vv);                                               \
+            u  = (mn*inv_bc1) / (rv*inv_sqrt_bc2 + 1e-8f);                      \
+            if(MOM8){ tv[j]=rv; if(rv>vmax)vmax=rv; } else Vv[k]=vv;            \
+        } else {                                                                \
+            float cc = b1*mv + (1.0f-b1)*gr;                                    \
+            u  = (float)((cc>0.0f)-(cc<0.0f));                                  \
+            mn = b2*mv + (1.0f-b2)*gr;                                          \
+        }                                                                       \
+        if(MOM8){ tmp[j]=mn; float a=fabsf(mn); if(a>amax)amax=a; }             \
+        else M[k]=mn;                                                           \
+        int dd=(int)dq[qi];                                                     \
+        int idl = qsr(-(L*u + dec*(float)dd), qi, (uint64_t)t);                 \
+        int rr = (int)rq[qi] + idl;                                             \
+        /* exact multi-carry, no loop and no clamp: the unique c with           \
+         * rr-128c in [-64,64], matching `while(rr>64){rr-=128;}` at the        \
+         * boundary (rr==64 must NOT carry). An earlier version clamped idl to  \
+         * +-64 and assumed one carry always sufficed -- wrong: L is ~48 LSBs   \
+         * at these learning rates and Adam's u exceeds 1 while v is small, so  \
+         * real steps do overflow a single carry. */                            \
+        int c = (rr > 64) ?  (((rr - 65) >> 7) + 1)                             \
+              : (rr < -64) ? -((((-rr) - 65) >> 7) + 1) : 0;                    \
+        rr -= c*128; dd += c;                                                   \
+        ncar += (c<0?-c:c);                                                     \
+        dd = dd<-dmax?-dmax:(dd>dmax?dmax:dd);                                  \
+        nsat += (dd==dmax)|(dd==-dmax);                                         \
+        ndead += (dd==0);                                                       \
+        sabs += (rr<0?-rr:rr);                                                  \
+        dq[qi]=(int8_t)dd; rq[qi]=(int8_t)rr;                                   \
+        P[k] = dith ? sg*((float)dd + (float)rr*(1.0f/128.0f)) : sg*(float)dd;  \
+    }
+
+static void qlm_step(Qlm *q, float *restrict P, const float *restrict G,
+                     float *restrict M, float *restrict Vv,
+                     float lr, float b1, float b2, float wd, float gscale, int t){
+    /* Integer AdamW. The plan claimed Adam could not drive an integer
+     * accumulator without reintroducing a float gradient scale -- that was
+     * wrong: the per-group scale s IS that scale, and is already stored. Adam's
+     * update converts to LSBs exactly the way Lion's does, the only difference
+     * being that `upd` is m_hat/(sqrt(v_hat)+eps) instead of sign(). Everything
+     * downstream (carry, clamp, decay, render) is unchanged. */
+    const int   adam = q->adam, mom8 = (q->mombits==8), dith = q->dither;
+    const int   dmax = q->dmax;
+    const float bc1 = adam ? 1.0f-powf(b1,(float)t) : 1.0f;
+    const float bc2 = adam ? 1.0f-powf(b2,(float)t) : 1.0f;
+    const float inv_bc1 = 1.0f/bc1, inv_sqrt_bc2 = 1.0f/sqrtf(bc2);
+    /* Weight update in weight units is  dw = -lr*(u + wd*w),  w = s*d, and one
+     * LSB of r is s/128, so in LSB units:  dr = -(lr*128/s)*u - lr*wd*128*d.
+     * The decay term is scale-free; only the sign term needs a scale. */
+    const float dec = lr*wd*128.0f;
+    int8_t  *restrict dq = q->d, *restrict rq = q->r, *restrict m8 = q->m8;
+    uint8_t *restrict v8 = q->v8;
+    long long carry=0, sat=0, dead=0, absr=0;
+    #pragma omp parallel for schedule(static) reduction(+:carry,sat,dead,absr)
+    for(long long gi=0; gi<(long long)q->ngrp; gi++){
+        const QGrp *g=&q->g[gi];
+        const float sg=q->s[gi];
+        const int   n=g->n;
+        const size_t qi0=g->qi, pof=g->pof;
+        /* both scales are overwritten after the loop, so capture the values the
+         * update must read (the previous step's) up front */
+        const float ms_old = mom8 ? q->m8s[gi] : 0.0f;
+        const float vs_old = (mom8 && adam) ? q->v8s[gi] : 0.0f;
+        /* `rel` (default): the step is a fixed number of LSBs per tensor, so the
+         * optimizer really does move digits at a uniform rate and the effective
+         * fp learning rate follows each group's own scale. `abs` reproduces
+         * float Lion's uniform-in-weight-units step exactly. */
+        const float L = lr*128.0f/(q->lrmode ? sg : q->sref[g->sp]);
+        float tmp[512], tv[512]; float amax=0.0f, vmax=0.0f;
+        long long ncar=0, nsat=0, ndead=0, sabs=0;
+
+        if(adam){ if(mom8) { QLM_BODY(1,1) } else { QLM_BODY(1,0) } }
+        else    { if(mom8) { QLM_BODY(0,1) } else { QLM_BODY(0,0) } }
+
+        carry+=ncar; sat+=nsat; dead+=ndead; absr+=sabs;
+
+        if(mom8){                             /* blockwise int8 momentum, SR */
+            float ms = amax>0 ? amax/127.0f : 1e-12f;
+            q->m8s[gi]=ms;
+            float inv=1.0f/ms;
+            for(int j=0;j<n;j++)
+                m8[qi0+(size_t)j] = (int8_t)qclampi(qsr(tmp[j]*inv, qi0+(size_t)j, (uint64_t)t+0x5EEDULL), -127,127);
+            if(adam){
+                float vs = vmax>0 ? vmax/255.0f : 1e-12f;
+                q->v8s[gi]=vs; float vinv=1.0f/vs;
+                for(int j=0;j<n;j++)
+                    v8[qi0+(size_t)j] = (uint8_t)qclampi(qsr(tv[j]*vinv, qi0+(size_t)j, (uint64_t)t+0xBEEFULL), 0,255);
+            }
+        }
+    }
+    q->n_carry=carry; q->n_sat=sat; q->n_dead=dead; q->sum_absr=(double)absr;
+}
+
+/* Scale servo. With no latent float weights there is nothing to recompute
+ * mean|W| from, so each group's scale is steered by how often it rails. */
+static void qlm_servo(Qlm *q){
+    long long up=0, dn=0;
+    #pragma omp parallel for schedule(static) reduction(+:up,dn)
+    for(long long gi=0; gi<(long long)q->ngrp; gi++){
+        const QGrp *g=&q->g[gi];
+        int rail=0;
+        for(int j=0;j<g->n;j++){ int dd=q->d[g->qi+j]; if(dd==q->dmax||dd==-q->dmax) rail++; }
+        float f=(float)rail/(float)g->n, sg=q->s[gi], sn;
+        if(f>q->f_hi){ sn=sg*1.09051f; up++; }        /* 2^(1/8) */
+        else if(f<q->f_lo){ sn=sg/1.09051f; dn++; }
+        else continue;
+        /* redistribute the digits at the new scale -- an integer operation, it
+         * never materializes a float master weight */
+        float conv=sg/sn;
+        for(int j=0;j<g->n;j++){
+            size_t qi=g->qi+j;
+            float t=((float)q->d[qi] + (float)q->r[qi]*(1.0f/128.0f))*conv;
+            int dd=qclampi((int)lrintf(t), -q->dmax, q->dmax);
+            int rr=qclampi((int)lrintf((t-(float)dd)*128.0f), -64, 64);
+            q->d[qi]=(int8_t)dd; q->r[qi]=(int8_t)rr;
+        }
+        q->s[gi]=sn;
+    }
+    q->n_servo_up=up; q->n_servo_dn=dn;
+}
+
+/* one optimizer step for the whole model */
+static void qlm_update(Qlm *q, float *P, const float *G, float *M, float *Vv, size_t np,
+                       float lr, float b1, float b2, float wd, float gscale, int t){
+    if(!q || !q->on){                       /* fp32 Lion on everything */
+        lion_span(P,G,M,0,np,lr,b1,b2,wd,gscale);
+        return;
+    }
+    /* un-quantized spans (embeddings, norms, router, MTP) follow the same
+     * optimizer family as the quantized ones, so the comparison isolates the
+     * representation and not a mixture of two update rules */
+    for(int i=0;i<q->nfs;i++){
+        if(q->adam) adamw(P+q->fs[i].off,(float*)G+q->fs[i].off,M+q->fs[i].off,
+                          Vv+q->fs[i].off,q->fs[i].n,lr,b1,b2,wd,t,gscale);
+        else        lion_span(P,G,M,q->fs[i].off,q->fs[i].n,lr,b1,b2,wd,gscale);
+    }
+    qlm_step(q,P,G,M,Vv,lr,b1,b2,wd,gscale,t);
+    if(q->servo_every>0 && (t % q->servo_every)==0) qlm_servo(q);
+}
+
+static void qlm_report(const Qlm *q, size_t np){
+    /* bits needed for one digit in [-dmax,+dmax]: 2*dmax+1 levels. The old
+     * form special-cased only dmax 1 and 7, so dmax=3 (3-bit) was reported as
+     * a full byte and overstated the state by ~0.45 B/param. */
+    double dbits = ceil(log2((double)(2*q->dmax+1)));
+    double packed = (double)q->nq*(dbits/8.0)                            /* digits */
+                  + (double)q->nq                                        /* residual */
+                  + (double)q->ngrp*2.0                                  /* fp16 scales */
+                  + (double)q->nq*(q->mombits==8?1.0:4.0)*(q->adam?2.0:1.0)  /* m (+v for Adam) */
+                  + (double)q->nf*8.0;                                   /* fp32 float spans + mom */
+    printf("[qlm] optimizer=%s\n", q->adam?"Integer AdamW":"Integer Lion");
+    printf("[qlm] %zu of %zu params quantized (%.1f%%) in %zu groups | bits=%d group=%d mom=%d lr=%s%s\n",
+           q->nq, np, 100.0*q->nq/np, q->ngrp,
+           q->dmax==1?2:q->dmax==3?3:q->dmax==7?4:8, q->group, q->mombits,
+           q->lrmode?"abs":"rel", q->dither?" DITHER":"");
+    printf("[qlm] training state %.2f B/param packed (%.2f MB) vs AdamW's 16.00 B/param (%.2f MB)\n",
+           packed/np, packed/1048576.0, np*16.0/1048576.0);
+}
+static void qlm_stats(const Qlm *q){
+    printf("[qlm] carry %.2f%%/step | rail %.1f%% | zero %.1f%% | mean|r| %.1f | servo +%lld/-%lld\n",
+           100.0*(double)q->n_carry/(double)q->nq, 100.0*(double)q->n_sat/(double)q->nq,
+           100.0*(double)q->n_dead/(double)q->nq, q->sum_absr/(double)q->nq,
+           q->n_servo_up, q->n_servo_dn);
+}
+
+static void qlm_save(const char *path, const Qlm *q){
+    FILE *f=fopen(path,"wb"); if(!f) return;
+    int hdr[6]={q->dmax,q->group,q->mombits,(int)q->nqs,(int)0,(int)0};
+    fwrite("QLM1",1,4,f); fwrite(hdr,4,6,f);
+    uint64_t nq=q->nq, ng=q->ngrp; fwrite(&nq,8,1,f); fwrite(&ng,8,1,f);
+    fwrite(q->d,1,q->nq,f); fwrite(q->r,1,q->nq,f);
+    fwrite(q->s,sizeof(float),q->ngrp,f);
+    if(q->mombits==8){ fwrite(q->m8,1,q->nq,f); fwrite(q->m8s,sizeof(float),q->ngrp,f); }
+    fclose(f);
+}
+static int qlm_load(const char *path, Qlm *q){
+    FILE *f=fopen(path,"rb"); if(!f) return 0;
+    char m[4]; int hdr[6]; uint64_t nq,ng;
+    if(fread(m,1,4,f)!=4 || memcmp(m,"QLM1",4)){ fclose(f); return 0; }
+    if(fread(hdr,4,6,f)!=6 || fread(&nq,8,1,f)!=1 || fread(&ng,8,1,f)!=1){ fclose(f); return 0; }
+    if(hdr[0]!=q->dmax || hdr[1]!=q->group || hdr[2]!=q->mombits
+       || nq!=q->nq || ng!=q->ngrp){
+        fprintf(stderr,"[qlm] %s has a different shape (bits/group/mom) -- ignoring\n",path);
+        fclose(f); return 0; }
+    if(fread(q->d,1,q->nq,f)!=q->nq || fread(q->r,1,q->nq,f)!=q->nq
+       || fread(q->s,sizeof(float),q->ngrp,f)!=q->ngrp){ fclose(f); return 0; }
+    if(q->mombits==8){ if(fread(q->m8,1,q->nq,f)!=q->nq) { fclose(f); return 0; }
+                       if(fread(q->m8s,sizeof(float),q->ngrp,f)!=q->ngrp){ fclose(f); return 0; } }
+    fclose(f); return 1;
+}
+
 /* ----------------------------- data ------------------------------------- */
 static uint16_t *load_u16(const char *path, size_t *count){
     FILE *f=fopen(path,"rb"); if(!f){ fprintf(stderr,"cannot open %s\n",path); exit(1); }
@@ -1059,8 +1574,16 @@ typedef struct {
     int V, eot, nmerges;
     uint8_t **dec; int *declen;               /* decode table */
     int base[256];
-    int *rank, *newid;                        /* V*V lookup (gen only) */
+    /* sparse merge map (gen only): open-addressing hash keyed by a*V+b */
+    uint64_t *mkey; int *mrank, *mnew; size_t mcap;
 } Tok;
+
+/* probe the sparse merge table; returns slot index (empty slot has mrank<0) */
+static inline size_t tok_slot(const Tok *tk, uint64_t key){
+    size_t mask=tk->mcap-1, i=(size_t)(key*0x9E3779B97F4A7C15ULL)&mask;
+    while(tk->mrank[i]>=0 && tk->mkey[i]!=key) i=(i+1)&mask;
+    return i;
+}
 
 /* read an entire file into a malloc'd buffer */
 static uint8_t *read_file(const char *path, size_t *len){
@@ -1071,11 +1594,25 @@ static uint8_t *read_file(const char *path, size_t *len){
     fclose(f); *len=sz; return b;
 }
 
-/* sequential memory reader */
-typedef struct { const uint8_t *p, *end; } Rd;
+/* sequential reader: memory (f==NULL) or file-backed streaming (f set, buf/cap
+ * a refill window). File-backed avoids slurping the whole model into RAM during
+ * load -- see load_q4_lowpeak. Small sequential reads only; n must be <= cap. */
+typedef struct { const uint8_t *p, *end; FILE *f; uint8_t *buf; size_t cap; } Rd;
+static int rd_refill(Rd *r, size_t need){
+    size_t rem=(size_t)(r->end - r->p);
+    if(rem) memmove(r->buf, r->p, rem);
+    size_t got=fread(r->buf+rem, 1, r->cap-rem, r->f);
+    r->p=r->buf; r->end=r->buf+rem+got;
+    return (size_t)(r->end - r->p) >= need;
+}
 static int rd(Rd *r, void *dst, size_t n){
+    if(r->f && (size_t)(r->end - r->p) < n && !rd_refill(r,n)) return 0;
     if(r->p + n > r->end) return 0;
     memcpy(dst, r->p, n); r->p += n; return 1;
+}
+static int rd_skip(Rd *r, size_t n){
+    if(r->p + n > r->end) return 0;
+    r->p += n; return 1;
 }
 
 /* parse a TLTK tokenizer blob from memory (copies what it keeps) */
@@ -1090,12 +1627,14 @@ static Tok *tok_parse(const uint8_t *data, size_t len, int full){
         if(l>0 && !rd(&r,tk->dec[i],l)){fprintf(stderr,"tok dec2\n");exit(1);} }
     if(!rd(&r,tk->base,4*256)){fprintf(stderr,"tok base\n");exit(1);}
     if(full){
-        tk->rank=malloc(sizeof(int)*(size_t)tk->V*tk->V);
-        tk->newid=malloc(sizeof(int)*(size_t)tk->V*tk->V);
-        for(size_t i=0;i<(size_t)tk->V*tk->V;i++){ tk->rank[i]=-1; tk->newid[i]=-1; }
+        size_t cap=16; while(cap < (size_t)tk->nmerges*2) cap<<=1;
+        tk->mcap=cap; tk->mkey=malloc(sizeof(uint64_t)*cap);
+        tk->mrank=malloc(sizeof(int)*cap); tk->mnew=malloc(sizeof(int)*cap);
+        for(size_t i=0;i<cap;i++){ tk->mrank[i]=-1; tk->mnew[i]=-1; }
         for(int m=0;m<tk->nmerges;m++){ int a,b,nw;
             if(!rd(&r,&a,4)||!rd(&r,&b,4)||!rd(&r,&nw,4)){fprintf(stderr,"tok merge\n");exit(1);}
-            size_t idx=(size_t)a*tk->V+b; if(tk->rank[idx]<0){tk->rank[idx]=m; tk->newid[idx]=nw;} }
+            uint64_t key=(uint64_t)a*tk->V+b; size_t i=tok_slot(tk,key);
+            if(tk->mrank[i]<0){ tk->mkey[i]=key; tk->mrank[i]=m; tk->mnew[i]=nw; } }
     }
     return tk;
 }
@@ -1108,10 +1647,10 @@ static int *tok_encode(const Tok *tk, const char *s, int *out_n){
     int n=strlen(s); int *ids=malloc(sizeof(int)*(n>0?n:1)); int cnt=0;
     for(int i=0;i<n;i++){ int b=(unsigned char)s[i]; int id=tk->base[b]; if(id<0) id=tk->base[(int)' ']; ids[cnt++]=id; }
     for(;;){ int best=-1, bi=-1;
-        for(int i=0;i+1<cnt;i++){ size_t idx=(size_t)ids[i]*tk->V+ids[i+1]; int r=tk->rank[idx];
+        for(int i=0;i+1<cnt;i++){ size_t s=tok_slot(tk,(uint64_t)ids[i]*tk->V+ids[i+1]); int r=tk->mrank[s];
             if(r>=0 && (best<0 || r<best)){ best=r; bi=i; } }
         if(bi<0) break;
-        size_t idx=(size_t)ids[bi]*tk->V+ids[bi+1]; ids[bi]=tk->newid[idx];
+        size_t s=tok_slot(tk,(uint64_t)ids[bi]*tk->V+ids[bi+1]); ids[bi]=tk->mnew[s];
         for(int j=bi+1;j+1<cnt;j++) ids[j]=ids[j+1];
         cnt--;
     }
@@ -1124,7 +1663,8 @@ static void tok_print(const Tok *tk, int id){
 
 /* ----------------------------- save/load model -------------------------- */
 /* header sizes by magic: TLM1=8 ints, TLM2=9 (+tmpl), TLM3=10 (+n_mtp) */
-static int hdr_ints(const char *m, int *v){  /* *v = version 1..5, returns #ints */
+static int hdr_ints(const char *m, int *v){  /* *v = version 1..6, returns #ints */
+    if(!memcmp(m,"TLM6",4)){ *v=6; return 15; }   /* adds n_shared, qknorm */
     if(!memcmp(m,"TLM5",4)){ *v=5; return 13; }   /* adds win, full_every */
     if(!memcmp(m,"TLM4",4)){ *v=4; return 11; }
     if(!memcmp(m,"TLM3",4)){ *v=3; return 10; }
@@ -1143,6 +1683,8 @@ static void cfg_from_hdr(Cfg *c, const int *hdr, int ver){
     c->n_exp = ver>=4 ? hdr[10] : 0;
     c->win        = ver>=5 ? hdr[11] : 0;
     c->full_every = ver>=5 ? hdr[12] : 0;
+    c->n_shared   = ver>=6 ? hdr[13] : 0;
+    c->qknorm     = ver>=6 ? hdr[14] : 0;
     c->rope_base=10000.0f; cfg_derive(c);
 }
 /* ---- fp16 <-> fp32 (portable software; weights are small normals) ---------- */
@@ -1172,6 +1714,72 @@ static float f16_to_f32(uint16_t h){
     else f=sign|((exp+112)<<23)|(mant<<13);
     float out; memcpy(&out,&f,4); return out;
 }
+/* Selective q4 (stored qtype=3): quantize only the QAT-quantized spans
+   (wq,wk,wv,wo and every expert w1/w3/w2, per layer) to 4-bit; store the gaps
+   (embeddings, norms, router, final norm, MTP heads) as fp16. Quantizing those
+   sensitive gaps to q4 -- norms sit near 1.0, the router decides top-k experts --
+   destroys generation even though bulk weight error stays ~1%. This mirrors
+   qlm_prepare's span selection exactly so PTQ matches the QAT layout. */
+typedef struct { size_t off, n; } Q4Span;
+/* Build the quantized spans in ascending param order (must match map_weights). */
+static int q4_spans(const Cfg *c, Q4Span *qs){       /* qs holds >= L*7 */
+    int E=n_slots(c), k=0; size_t p=(size_t)c->V*c->D;   /* skip emb */
+    for(int l=0;l<c->L;l++){
+        p+=c->D;                                                              /* an1 */
+        qs[k].off=p; qs[k].n=(size_t)c->D*c->D;  k++; p+=(size_t)c->D*c->D;   /* wq */
+        qs[k].off=p; qs[k].n=(size_t)c->D*c->KD; k++; p+=(size_t)c->D*c->KD;  /* wk */
+        qs[k].off=p; qs[k].n=(size_t)c->D*c->KD; k++; p+=(size_t)c->D*c->KD;  /* wv */
+        qs[k].off=p; qs[k].n=(size_t)c->D*c->D;  k++; p+=(size_t)c->D*c->D;   /* wo */
+        if(c->qknorm){ p+=c->hd; p+=c->hd; }                                  /* qn,kn (fp) */
+        p+=c->D;                                                              /* an2 */
+        if(c->n_exp>0) p+=(size_t)c->D*c->n_exp;                              /* router (fp) */
+        qs[k].off=p; qs[k].n=(size_t)E*c->D*c->F; k++; p+=(size_t)E*c->D*c->F;/* w1 */
+        qs[k].off=p; qs[k].n=(size_t)E*c->D*c->F; k++; p+=(size_t)E*c->D*c->F;/* w3 */
+        qs[k].off=p; qs[k].n=(size_t)E*c->F*c->D; k++; p+=(size_t)E*c->F*c->D;/* w2 */
+    }
+    return k;   /* nf + mtp stay in the trailing fp gap */
+}
+static uint8_t *q4_selective_encode(const float *P, size_t n, const Cfg *c, int group, size_t *out_len){
+    Q4Span qs[1024]; int nq=q4_spans(c,qs);
+    uint8_t *out=malloc(n*2+64); size_t o=0, cur=0;
+    for(int i=0;i<nq;i++){
+        for(size_t k=cur;k<qs[i].off;k++){ uint16_t h=f32_to_f16(P[k]); memcpy(out+o,&h,2); o+=2; }
+        size_t so=qs[i].off, sn=qs[i].n;
+        for(size_t j=0;j<sn;j+=group){
+            int g=(j+(size_t)group<=sn)?group:(int)(sn-j);
+            float amax=0; for(int t=0;t<g;t++){ float a=fabsf(P[so+j+t]); if(a>amax)amax=a; }
+            float scale=amax>0?amax/7.0f:1.0f;
+            uint16_t sh=f32_to_f16(scale); memcpy(out+o,&sh,2); o+=2;
+            for(int t=0;t<g;t+=2){
+                int v0=(int)lrintf(P[so+j+t]/scale); if(v0>7)v0=7; if(v0<-7)v0=-7;
+                int v1=0; if(t+1<g){ v1=(int)lrintf(P[so+j+t+1]/scale); if(v1>7)v1=7; if(v1<-7)v1=-7; }
+                out[o++]=(uint8_t)((v0&0xF)|((v1&0xF)<<4));
+            }
+        }
+        cur=so+sn;
+    }
+    for(size_t k=cur;k<n;k++){ uint16_t h=f32_to_f16(P[k]); memcpy(out+o,&h,2); o+=2; }
+    *out_len=o; return out;
+}
+static int q4_selective_decode(Rd *r, float *P, size_t n, const Cfg *c, int group){
+    Q4Span qs[1024]; int nq=q4_spans(c,qs); size_t cur=0;
+    for(int i=0;i<nq;i++){
+        for(size_t k=cur;k<qs[i].off;k++){ uint16_t h; if(!rd(r,&h,2))return 0; P[k]=f16_to_f32(h); }
+        size_t so=qs[i].off, sn=qs[i].n;
+        for(size_t j=0;j<sn;j+=group){
+            int g=(j+(size_t)group<=sn)?group:(int)(sn-j);
+            uint16_t sh; if(!rd(r,&sh,2))return 0; float scale=f16_to_f32(sh);
+            for(int t=0;t<g;t+=2){
+                uint8_t b; if(!rd(r,&b,1))return 0;
+                int lo=b&0xF; if(lo>=8)lo-=16; P[so+j+t]=(float)lo*scale;
+                if(t+1<g){ int hi=(b>>4)&0xF; if(hi>=8)hi-=16; P[so+j+t+1]=(float)hi*scale; }
+            }
+        }
+        cur=so+sn;
+    }
+    for(size_t k=cur;k<n;k++){ uint16_t h; if(!rd(r,&h,2))return 0; P[k]=f16_to_f32(h); }
+    return 1;
+}
 /* Quantize P[n] -> malloc'd byte buffer (*out_len). qtype 0=fp16 (2B/w),
    1=q8 (Q8_0-style block: fp16 scale + int8 per `group` weights). */
 static uint8_t *quantize_params(const float *P, size_t n, int qtype, int group, size_t *out_len){
@@ -1179,6 +1787,21 @@ static uint8_t *quantize_params(const float *P, size_t n, int qtype, int group, 
         uint16_t *q=malloc(n*2>0?n*2:2);
         for(size_t i=0;i<n;i++) q[i]=f32_to_f16(P[i]);
         *out_len=n*2; return (uint8_t*)q;
+    }
+    if(qtype==2){  /* q4: fp16 scale + 4-bit symmetric [-7,7], 2 weights/byte (matches QAT/ngram) */
+        size_t nb=(n+group-1)/group; uint8_t *q=malloc(nb*2+(n+1)/2+8); size_t o=0;
+        for(size_t i=0;i<n;i+=group){
+            int g=(i+(size_t)group<=n)?group:(int)(n-i);
+            float amax=0; for(int j=0;j<g;j++){ float a=fabsf(P[i+j]); if(a>amax)amax=a; }
+            float scale=amax>0?amax/7.0f:1.0f;
+            uint16_t sh=f32_to_f16(scale); memcpy(q+o,&sh,2); o+=2;
+            for(int j=0;j<g;j+=2){
+                int v0=(int)lrintf(P[i+j]/scale); if(v0>7)v0=7; if(v0<-7)v0=-7;
+                int v1=0; if(j+1<g){ v1=(int)lrintf(P[i+j+1]/scale); if(v1>7)v1=7; if(v1<-7)v1=-7; }
+                q[o++]=(uint8_t)((v0&0xF)|((v1&0xF)<<4));
+            }
+        }
+        *out_len=o; return q;
     }
     size_t nb=(n+group-1)/group; uint8_t *q=malloc(nb*2+n+1); size_t o=0;
     for(size_t i=0;i<n;i+=group){
@@ -1195,6 +1818,18 @@ static uint8_t *quantize_params(const float *P, size_t n, int qtype, int group, 
 static int dequantize_params(Rd *r, float *P, size_t n, int qtype, int group){
     if(qtype==0){
         for(size_t i=0;i<n;i++){ uint16_t h; if(!rd(r,&h,2)) return 0; P[i]=f16_to_f32(h); }
+        return 1;
+    }
+    if(qtype==2){  /* q4: fp16 scale + 4-bit symmetric, 2 weights/byte */
+        for(size_t i=0;i<n;i+=group){
+            int g=(i+(size_t)group<=n)?group:(int)(n-i);
+            uint16_t sh; if(!rd(r,&sh,2)) return 0; float scale=f16_to_f32(sh);
+            for(int j=0;j<g;j+=2){
+                uint8_t b; if(!rd(r,&b,1)) return 0;
+                int lo=b&0xF; if(lo>=8)lo-=16; P[i+j]=(float)lo*scale;
+                if(j+1<g){ int hi=(b>>4)&0xF; if(hi>=8)hi-=16; P[i+j+1]=(float)hi*scale; }
+            }
+        }
         return 1;
     }
     for(size_t i=0;i<n;i+=group){
@@ -1231,13 +1866,16 @@ static float *model_load(const char *path, Cfg *c){
     if(!buf){fprintf(stderr,"cannot open %s\n",path);exit(1);}
     Rd r={buf,buf+len}; char m[4]; rd(&r,m,4);
     /* TLQ1 mirrors TLM4 (11 ints), TLQ2 mirrors TLM5 (13, carries win). */
-    int qz = !memcmp(m,"TLQ1",4) ? 1 : (!memcmp(m,"TLQ2",4) ? 2 : 0);
+    int qz = !memcmp(m,"TLQ1",4) ? 1 : (!memcmp(m,"TLQ2",4) ? 2 :
+             (!memcmp(m,"TLQ3",4) ? 3 : 0));
     if(qz){
-        int nh = qz==1 ? 11 : 13, qver = qz==1 ? 4 : 5;
+        int nh = qz==1 ? 11 : (qz==2 ? 13 : 15), qver = qz==1 ? 4 : (qz==2 ? 5 : 6);
         int hdr[HDR_MAX]; rd(&r,hdr,4*nh); cfg_from_hdr(c,hdr,qver);
         int qtype=0,group=64; rd(&r,&qtype,4); rd(&r,&group,4);
         size_t n=param_count(c); float *P=fz(n);
-        if(!dequantize_params(&r,P,n,qtype,group)){fprintf(stderr,"quant body\n");exit(1);}
+        int ok = qtype==3 ? q4_selective_decode(&r,P,n,c,group)
+                          : dequantize_params(&r,P,n,qtype,group);
+        if(!ok){fprintf(stderr,"quant body\n");exit(1);}
         free(buf); return P;
     }
     int ver, nh=hdr_ints(m,&ver);
@@ -1247,19 +1885,39 @@ static float *model_load(const char *path, Cfg *c){
     if(!rd(&r,P,sizeof(float)*n)){fprintf(stderr,"model body\n");exit(1);}
     free(buf); return P;
 }
-/* load params AND the embedded tokenizer. Handles TLM2-4 and TLQ1. TLM1 -> tk NULL. */
+/* Shared experts change what the FFN COMPUTES, not just the layout: slots
+ * n_exp..n_exp+n_shared-1 run for every token in addition to the routed one.
+ * The layout above accounts for them so param_count and the file size agree,
+ * but neither forward path applies them yet -- and the q8 decode path would
+ * additionally need its own pre-quantised copies. Loading such a model and
+ * quietly skipping those experts would produce plausible-looking garbage, so
+ * this refuses instead. QK-norm IS implemented; only n_shared is missing. */
+static void check_supported(const Cfg *c, const char *path){
+    if(c->n_shared>0){
+        fprintf(stderr,
+            "%s uses %d shared expert(s), which the CPU build does not implement yet.\n"
+            "  The forward pass would silently omit them. Run it with cudalm instead.\n",
+            path, c->n_shared);
+        exit(1);
+    }
+}
+/* load params AND the embedded tokenizer. Handles TLM2-6 and TLQ1-3. TLM1 -> tk NULL. */
 static float *model_load_full(const char *path, Cfg *c, Tok **tk_out){
     size_t len; uint8_t *buf=read_file(path,&len);
     if(!buf){fprintf(stderr,"cannot open %s\n",path);exit(1);}
     Rd r={buf,buf+len}; char m[4]; rd(&r,m,4);
     *tk_out=NULL;
-    int qz = !memcmp(m,"TLQ1",4) ? 1 : (!memcmp(m,"TLQ2",4) ? 2 : 0);
+    int qz = !memcmp(m,"TLQ1",4) ? 1 : (!memcmp(m,"TLQ2",4) ? 2 :
+             (!memcmp(m,"TLQ3",4) ? 3 : 0));
     if(qz){                                                    /* quantized checkpoint */
-        int nh = qz==1 ? 11 : 13, qver = qz==1 ? 4 : 5;
+        int nh = qz==1 ? 11 : (qz==2 ? 13 : 15), qver = qz==1 ? 4 : (qz==2 ? 5 : 6);
         int hdr[HDR_MAX]; rd(&r,hdr,4*nh); cfg_from_hdr(c,hdr,qver);
         int qtype=0,group=64; rd(&r,&qtype,4); rd(&r,&group,4);
         size_t n=param_count(c); float *P=fz(n);
-        if(!dequantize_params(&r,P,n,qtype,group)){fprintf(stderr,"quant body\n");exit(1);}
+        int ok = qtype==3 ? q4_selective_decode(&r,P,n,c,group)
+                          : dequantize_params(&r,P,n,qtype,group);
+        if(!ok){fprintf(stderr,"quant body\n");exit(1);}
+        check_supported(c,path);
         int tl=0; if(rd(&r,&tl,4) && tl>0){ *tk_out=tok_parse(r.p,tl,1); }
         free(buf); return P;
     }
@@ -1267,10 +1925,194 @@ static float *model_load_full(const char *path, Cfg *c, Tok **tk_out){
     if(!nh){fprintf(stderr,"bad model magic\n");exit(1);}
     int hdr[HDR_MAX]; rd(&r,hdr,4*nh);
     cfg_from_hdr(c,hdr,ver);
+    check_supported(c,path);
     size_t n=param_count(c); float *P=fz(n);
     if(!rd(&r,P,sizeof(float)*n)){fprintf(stderr,"model body\n");exit(1);}
     if(ver>=2){ int tl=0; if(rd(&r,&tl,4) && tl>0){ *tk_out=tok_parse(r.p,tl,1); } }
     free(buf); return P;
+}
+/* FNV-1a hash for n-gram key, matching cudalm.cu */
+static unsigned int ng_hash(int t_prev, int t_cur, int R){
+    if(t_prev<0) return (unsigned int)-1;  /* skip if no prior token */
+    unsigned int h=2166136261u;
+    h=(h^(unsigned)t_prev)*16777619u;
+    h=(h^(unsigned)t_cur)*16777619u;
+    h^=h>>15;
+    return h%R;
+}
+
+/* Unpack 4-bit digit with sign-extension */
+static int q4_unpack(const signed char *d, unsigned long long i){
+    unsigned char b=(unsigned char)d[i>>1];
+    int v=(i&1) ? (b>>4) : (b&0xF);
+    return v>=8 ? v-16 : v;
+}
+
+/* Dequantize one contiguous De-nibble row (base index 0) with a single scale. */
+static void ng_render_bytes(const signed char *rowb, float sg, int De, float *row){
+    for(int j=0;j<De;j++) row[j] = sg * (float)q4_unpack(rowb, (unsigned long long)j);
+}
+/* Gather one row from the q4 table (RAM or disk) and dequantize into row[De].
+   When ng->d is NULL the De/2 packed bytes are read from ng->fs on demand;
+   scratch (>= De/2 bytes) backs the disk read. */
+static void ng_q4_render_row(const Ng *ng, int De, unsigned int key, float *row, signed char *scratch){
+    if(key==(unsigned int)-1){ memset(row,0,De*sizeof(float)); return; }
+    int gi=key/ng->group; if(gi>=ng->ngrp) gi=ng->ngrp-1;
+    float sg=ng->s[gi];
+    if(ng->d){ ng_render_bytes(ng->d + (unsigned long long)key*(De/2), sg, De, row); return; }
+    /* streaming: rows are De nibbles = De/2 bytes, byte-aligned since De is even */
+    long long off = ng->doff + (long long)key*(De/2);
+    if(_fseeki64(ng->fs, off, SEEK_SET)!=0 || fread(scratch, 1, De/2, ng->fs)!=(size_t)(De/2)){
+        memset(row,0,De*sizeof(float)); return;
+    }
+    ng_render_bytes(scratch, sg, De, row);
+}
+
+/* N-gram forward: hash bigram (tok[t-1], tok[t]) -> gather -> project Wng -> add to activation */
+static void ngram_forward(const Cfg *c, const Ng *ng, const int *tokens, int m, int start_pos,
+                          float *x){
+    if(!ng->Wng) return;  /* n-gram not loaded */
+    int V=c->V, D=c->D, De=ng->De, R=ng->R;
+    float *buf=(float*)malloc(De*sizeof(float));
+    signed char *scratch=(signed char*)malloc(De/2);  /* backs disk read when streaming */
+    for(int j=0;j<m;j++){
+        /* get prior token (at position start_pos+j-1 in the full sequence) */
+        int t_prev=-1;
+        if(start_pos+j>0){
+            if(j>0) t_prev=tokens[j-1];
+            /* else: prior token is outside this chunk, would need external state */
+        }
+        int t_cur=tokens[j]; if(t_cur<0||t_cur>=V) t_cur=-1;
+        unsigned int key=(t_cur>=0) ? ng_hash(t_prev,t_cur,R) : (unsigned int)-1;
+        ng_q4_render_row(ng, De, key, buf, scratch);
+        /* project buf[De] through Wng[De x D] and add to x[D] */
+        float *xj=x+(size_t)j*D;
+        for(int d=0;d<D;d++){
+            float sum=0.0f;
+            for(int e=0;e<De;e++) sum += buf[e]*ng->Wng[e*D + d];
+            xj[d] += sum;
+        }
+    }
+    free(buf); free(scratch);
+}
+
+/* Streaming loader (TINYLM_NGSTREAM): keep Wng+scales in RAM (~4.5MB), leave the
+   ~64MB digit block on disk and fetch De/2 bytes per row in ngram_forward. */
+static int ngram_load_stream(const char *path, const Cfg *c, Ng *ng){
+    FILE *f=fopen(path,"rb");
+    if(!f){fprintf(stderr,"[ng] stream: no file %s\n",path); return 0;}
+    char m[4];
+    if(fread(m,1,4,f)!=4 || memcmp(m,"NGR1",4)){fprintf(stderr,"[ng] stream: bad magic\n"); fclose(f); return 0;}
+    int hdr[5];
+    if(fread(hdr,4,5,f)!=5){fprintf(stderr,"[ng] stream: hdr\n"); fclose(f); return 0;}
+    int R=hdr[0], De=hdr[1], order=hdr[2], q4=hdr[3];
+    if(R<=0||R>=(1<<24)||De<=0||De>=1024||order!=2||q4!=1||(De&1)){
+        fprintf(stderr,"[ng] stream: bad header R=%d De=%d order=%d q4=%d\n",R,De,order,q4);
+        fclose(f); return 0;
+    }
+    int D=c->D; size_t nw=(size_t)De*D, nt=(size_t)R*De, nd=(nt+1)/2;
+    ng->R=R; ng->De=De; ng->order=order; ng->group=128; ng->ngrp=(int)((nt+127)/128);
+    size_t ng4=(size_t)ng->ngrp*4;
+    ng->Wng=(float*)malloc(nw*sizeof(float));
+    ng->s=(float*)malloc(ng4);
+    ng->d=NULL;
+    if(!ng->Wng||!ng->s){fprintf(stderr,"[ng] stream: oom\n"); goto fail;}
+    if(fread(ng->Wng,sizeof(float),nw,f)!=nw){fprintf(stderr,"[ng] stream: Wng read\n"); goto fail;}
+
+    /* file size, and bytes remaining after Wng, to distinguish slim vs full layout */
+    long long after_wng=_ftelli64(f);
+    if(_fseeki64(f,0,SEEK_END)!=0){fprintf(stderr,"[ng] stream: seek end\n"); goto fail;}
+    long long fsz=_ftelli64(f);
+    long long left=fsz-after_wng;
+    long long slim_left=(long long)nd + (long long)ng4 + 4;
+    if(left==slim_left){
+        ng->doff=after_wng;                                   /* digits immediately follow Wng */
+        if(_fseeki64(f, after_wng+(long long)nd, SEEK_SET)!=0){fprintf(stderr,"[ng] stream: seek scales\n"); goto fail;}
+        if(fread(ng->s,1,ng4,f)!=ng4){fprintf(stderr,"[ng] stream: scales\n"); goto fail;}
+        if(fread(&ng->sref,4,1,f)!=1){fprintf(stderr,"[ng] stream: sref\n"); goto fail;}
+    } else {
+        /* full layout: WM/WV bf16 (4*nw) + sref + digits + residual+m8+v8 (3*nt) + scales... */
+        ng->doff=after_wng + (long long)(4*nw) + 4;
+        long long scales_off=ng->doff + (long long)nd + 3*(long long)nt;
+        if(_fseeki64(f, scales_off, SEEK_SET)!=0){fprintf(stderr,"[ng] stream: seek scales(full)\n"); goto fail;}
+        if(fread(ng->s,1,ng4,f)!=ng4){fprintf(stderr,"[ng] stream: scales(full)\n"); goto fail;}
+        ng->sref=1.0f;
+    }
+    ng->fs=f;
+    fprintf(stderr,"[ng] stream: digits on disk (%.1fMB) at off=%lld, Wng+scales in RAM (%.1fMB), sref=%g\n",
+            (double)nd/1e6, ng->doff, (double)(nw*4+ng4)/1e6, ng->sref);
+    return 1;
+fail: fclose(f); free(ng->Wng); free(ng->s); memset(ng,0,sizeof(*ng)); return 0;
+}
+
+/* Load n-gram table from .opt.ng sidecar (bigram embedding + q4 quantization) */
+static int ngram_load(const char *base_path, const Cfg *c, Ng *ng){
+    fprintf(stderr,"[ng] ngram_load called with base_path=%s\n", base_path); fflush(stderr);
+    size_t blen=strlen(base_path);
+    if(blen+5>=256) {fprintf(stderr,"[ng] path too long\n"); fflush(stderr); return 0;}
+    char path[256]; strcpy(path,base_path); strcpy(path+blen,".opt.ng");
+    fprintf(stderr,"[ng] trying to load: %s\n", path); fflush(stderr);
+
+    if(getenv("TINYLM_NGSTREAM")) return ngram_load_stream(path, c, ng);
+
+    size_t len; uint8_t *buf=read_file(path,&len);
+    fprintf(stderr,"[ng] read_file returned: buf=%p len=%zu\n", (void*)buf, len); fflush(stderr);
+    if(!buf) {fprintf(stderr,"[ng] no file, returning 0\n"); fflush(stderr); return 0;}  /* no n-gram file, silently ok */
+
+    Rd r={buf,buf+len}; char m[4]; rd(&r,m,4);
+    if(memcmp(m,"NGR1",4)){fprintf(stderr,"bad ngram magic\n"); fflush(stderr); free(buf); return 0;}
+
+    int hdr[5]; rd(&r,hdr,4*5);  /* R, De, order, q4, iter */
+    int R=hdr[0], De=hdr[1], order=hdr[2], q4=hdr[3];
+    if(R<=0||R>=(1<<24)||De<=0||De>=1024||order!=2||q4!=1){
+        fprintf(stderr,"[ng] bad header: R=%d De=%d order=%d q4=%d\n",R,De,order,q4);
+        free(buf); return 0;
+    }
+
+    int D=c->D; size_t nw=(size_t)De*D, nt=(size_t)R*De;
+    ng->R=R; ng->De=De; ng->order=order; ng->group=128; ng->ngrp=(int)((nt+127)/128);
+    ng->Wng=(float*)malloc(nw*sizeof(float));
+    ng->d=(signed char*)malloc((nt+1)/2);
+    ng->s=(float*)malloc((size_t)ng->ngrp*sizeof(float));
+
+    fprintf(stderr,"[ng] reading: nw=%zu nt=%zu nd=%zu file_len=%zu\n",
+            nw*sizeof(float), nt, (nt+1)/2, (size_t)(r.end-r.p)); fflush(stderr);
+
+    if(!rd(&r,ng->Wng,nw*sizeof(float))){
+        fprintf(stderr,"[ng] Wng read failed: ptr=%zu end=%zu\n", (size_t)(r.p-buf), (size_t)(r.end-buf));
+        goto fail;
+    }
+    fprintf(stderr,"[ng] Wng read ok, at pos %zu\n", (size_t)(r.p-buf));
+
+    /* Two on-disk layouts are supported, distinguished by bytes remaining after Wng:
+       SLIM (inference export, slim_ng.py): digits, scales, sref
+       FULL (cudalm .opt.ng optimizer checkpoint):
+             WM/WV bf16 (4*nw) + sref + digits + residual(nt) + m8(nt) + v8(nt)
+             + scales(ngrp*4) + ms(ngrp*4) + vs(ngrp*4)                                */
+    size_t nd=(nt+1)/2, ng4=(size_t)ng->ngrp*4;
+    size_t left=r.end-r.p;
+    size_t slim_left=nd + ng4 + 4;
+    if(left==slim_left){
+        fprintf(stderr,"[ng] slim layout (%zu bytes): digits, scales, sref\n", left);
+        if(!rd(&r,ng->d,nd)){fprintf(stderr,"[ng] digits read\n"); goto fail;}
+        if(!rd(&r,ng->s,ng4)){fprintf(stderr,"[ng] scales read\n"); goto fail;}
+        if(!rd(&r,&ng->sref,sizeof(float))){fprintf(stderr,"[ng] sref read\n"); goto fail;}
+    } else {
+        fprintf(stderr,"[ng] full layout (%zu bytes): skipping optimizer state\n", left);
+        if(!rd_skip(&r, 4*nw)){fprintf(stderr,"[ng] WM/WV skip\n"); goto fail;}   /* bf16 WM,WV */
+        if(!rd_skip(&r, 4)){fprintf(stderr,"[ng] sref skip\n"); goto fail;}        /* sref */
+        if(!rd(&r,ng->d,nd)){fprintf(stderr,"[ng] digits read\n"); goto fail;}
+        if(!rd_skip(&r, nt)){fprintf(stderr,"[ng] residual skip\n"); goto fail;}
+        if(!rd_skip(&r, nt)){fprintf(stderr,"[ng] m8 skip\n"); goto fail;}
+        if(!rd_skip(&r, nt)){fprintf(stderr,"[ng] v8 skip\n"); goto fail;}
+        if(!rd(&r,ng->s,ng4)){fprintf(stderr,"[ng] scales read\n"); goto fail;}
+        ng->sref = 1.0f;                                                           /* ms,vs unused */
+    }
+    fprintf(stderr,"[ng] loaded: digits %.1fMB, scales %d groups, sref=%g\n",
+            (double)nd/1e6, ng->ngrp, ng->sref);
+
+    free(buf); return 1;
+fail: free(buf); free(ng->Wng); free(ng->d); free(ng->s); memset(ng,0,sizeof(*ng)); return 0;
 }
 /* AdamW state sidecar (<out>.opt): magic, iter, then M[n], V[n] */
 static void opt_save(const char *path, int iter, const float *M, const float *Vv, size_t n){
@@ -1326,7 +2168,11 @@ static void train_loop(const Cfg *c, Weights *w, Weights *gr,
     double val_sec   = env_sec("TINYLM_VAL_SEC", 600.0);    /* expensive val eval (4 batches) */
     double save_sec  = env_sec("TINYLM_SAVE_SEC", 300.0);   /* checkpoint to disk */
     double last_print=wall0, last_val=wall0, last_save=wall0;
+    int timeup=0;
     float beta1=0.9f,beta2=0.95f,wd=0.1f, warmup=200.0f;
+    { const char *e=getenv("TINYLM_WARMUP"); if(e){ float v=(float)atof(e); if(v>=1) warmup=v; } }
+    if(g_opt_lion && !g_qadam){ beta2=0.99f; }        /* Lion's momentum beta */
+    if(g_wd_over>=0) wd=g_wd_over;
     float tr_loss=0.0f;
     for(int it=start_iter; it<=iters; it++){
         float cur_lr;
@@ -1335,7 +2181,11 @@ static void train_loop(const Cfg *c, Weights *w, Weights *gr,
                cur_lr=0.1f*lr + 0.5f*(1+cosf(3.14159265f*r))*(lr-0.1f*lr); }
         double wall=wtime();
         if(it==start_iter || it==iters || wall-last_val>=val_sec){   /* val: time-based + endpoints */
+            /* 4 batches = 8k tokens is far too small a sample to resolve the
+             * ~0.05-nat effects an A/B cares about; measured run-to-run spread
+             * at vb=4 was 0.09 nats on identical configs. Raise it for A/Bs. */
             float vloss=0; int vb=4;
+            { const char *e=getenv("TINYLM_VALB"); if(e){ int v=atoi(e); if(v>=1) vb=v; } }
             for(int q=0;q<vb;q++){
                 for(int i=0;i<B;i++){ size_t st=(xorshift()%(nvl-c->T-1));
                     for(int j=0;j<c->T;j++){ tok[i*c->T+j]=vl[st+j]; tgt[i*c->T+j]=vl[st+j+1]; } }
@@ -1345,9 +2195,22 @@ static void train_loop(const Cfg *c, Weights *w, Weights *gr,
             char elb[24];
             printf("iter %5d (ep %.2f) | val %.4f | lr %.2e | %s\n",
                    it, (double)it/spe, vloss, cur_lr, fmt_dur(wall-wall0,elb,sizeof elb));
+            if(g_q && g_q->on && it>start_iter) qlm_stats(g_q);
             fflush(stdout); last_val=wall; last_print=wall;
         }
         if(it==iters) break;
+        /* Wall-clock cap, so two models of different SIZE can be compared over
+         * the same amount of COMPUTE rather than the same iteration count.
+         * Mirrors CUDALM_MAX_SECONDS on the GPU backend.
+         * `it--; continue;` re-enters this iteration with iters==it, which makes
+         * the val block at the top fire once before the loop exits -- so the
+         * final val is taken AFTER the cap and its cost is not charged to the
+         * training budget. That matters when comparing models of different size,
+         * where evaluation cost differs several-fold. */
+        if(g_max_sec>0 && !timeup && wtime()-wall0>=g_max_sec){
+            printf("[train] TINYLM_MAX_SECONDS reached at iter %d\n", it); fflush(stdout);
+            timeup=1; iters=it; it--; continue;
+        }
         size_t span=(size_t)c->T + c->n_mtp + 2;
         for(int i=0;i<B;i++){ size_t st=(xorshift()%(ntr-span));
             for(int j=0;j<c->T;j++){ int r=i*c->T+j; tok[r]=tr[st+j]; tgt[r]=tr[st+j+1];
@@ -1357,7 +2220,8 @@ static void train_loop(const Cfg *c, Weights *w, Weights *gr,
         backward(c,w,gr,a,tok,tgt,tgt_mtp);
         float gnm=global_gradnorm(G,np);
         float gscale = gnm>1.0f ? 1.0f/gnm : 1.0f;   /* clip folded into adamw */
-        adamw(P,G,M,Vv,np,cur_lr,beta1,beta2,wd,it+1,gscale);
+        if(g_opt_lion) qlm_update(g_q,P,G,M,Vv,np,cur_lr,beta1,beta2,wd,gscale,it+1);
+        else           adamw(P,G,M,Vv,np,cur_lr,beta1,beta2,wd,it+1,gscale);
         wall=wtime();
         if(it>start_iter && wall-last_print>=print_sec){   /* cheap progress: loss + tok/s + ETA */
             double done=wall-wall0, sps=done/(it-start_iter), eta=(iters-it)*sps;
@@ -1370,12 +2234,14 @@ static void train_loop(const Cfg *c, Weights *w, Weights *gr,
         if(it>start_iter && wall-last_save>=save_sec){     /* checkpoint: time-based */
             model_save_bundle(out,c,P,np,tok_blob,tok_len);
             opt_save(optpath,it,M,Vv,np);
+            if(g_q && g_q->on){ char qp[1200]; snprintf(qp,sizeof qp,"%s.q",optpath); qlm_save(qp,g_q); }
             printf("[ckpt] saved %s @ iter %d (ep %.2f)\n", out, it, (double)it/spe); fflush(stdout);
             last_save=wtime();   /* exclude the disk-write time from the next interval */
         }
     }
     model_save_bundle(out,c,P,np,tok_blob,tok_len);
     opt_save(optpath,iters,M,Vv,np);
+    if(g_q && g_q->on){ char qp[1200]; snprintf(qp,sizeof qp,"%s.q",optpath); qlm_save(qp,g_q); }
 }
 
 /* read data_dir's tokenizer.bin (blob+V+eot), template, and train/val token streams */
@@ -1429,17 +2295,50 @@ static int cmd_train(int argc, char **argv){
         fprintf(stderr,"error: model vocab %d != data vocab %d (different tokenizer).\n"
                        "Use a fresh model for this data:  tinylm new <name> <preset>\n", c.V, dataV);
         return 1; }
+    if(c.qknorm || c.n_shared>0){
+        fprintf(stderr,"this checkpoint uses %s%s%s, which the CPU backward does not\n"
+                       "  implement -- training it here would produce wrong gradients for\n"
+                       "  those parameters. Train it with cudalm; inference here is fine.\n",
+                c.qknorm?"QK-norm":"", (c.qknorm&&c.n_shared>0)?" and ":"",
+                c.n_shared>0?"shared experts":"");
+        exit(1);
+    }
     c.V=dataV; c.eot=dataEot; c.tmpl=tmpl; cfg_derive(&c);
     B=auto_batch(&c);          /* memory-aware: 32 for small models, less for big */
 
     float lr=default_lr_for(&c);
+    /* QLM_OPT: adamw (stock, default) | lion (fp32 Lion, isolates the optimizer)
+     *        | qlion (Integer Lion over low-bit digit weights -- the experiment) */
+    const char *qopt=getenv("QLM_OPT"); if(!qopt) qopt="adamw";
+    int use_qadam = !strcmp(qopt,"qadam");
+    int use_qlion = !strcmp(qopt,"qlion") || use_qadam;
+    { const char *e=getenv("QLM_ACT8"); g_act8 = e ? atoi(e) : 0; }
+    if(g_act8) printf("[qlm] int8 activations (fake-quant, STE) ON\n");
+    g_opt_lion = use_qlion || !strcmp(qopt,"lion");
+    /* LR scale and weight decay apply to EVERY optimizer, so the baseline can be
+     * tuned on the same grid as the experiment -- comparing a swept Lion against
+     * an unswept AdamW would be worthless. */
+    { const char *e;
+      if((e=getenv("QLM_LRSCALE"))) lr *= (float)atof(e);
+      else if(g_opt_lion && !use_qadam) lr *= 0.1f;
+      if((e=getenv("QLM_WD")))      g_wd_over = (float)atof(e);
+      else if(g_opt_lion && !use_qadam) g_wd_over = 1.0f; }
+    g_qadam = use_qadam;
+    g_max_sec = env_sec("TINYLM_MAX_SECONDS", 0.0);
     rope_init(&c, c.T);
     size_t np=param_count(&c);
     float *P=fz(np),*G=fz(np),*M=fz(np),*Vv=fz(np);
-    Weights w,gr; map_weights(&c,P,&w); map_weights(&c,G,&gr);
+    Weights w,gr; map_weights(&c,P,&w); map_weights(&c,G,&gr); memset(&w.ng,0,sizeof(w.ng)); memset(&gr.ng,0,sizeof(gr.ng));
     int start_iter=0;
     if(fresh){ init_params(&c,&w); if(loaded) free(loaded); }
     else { memcpy(P,loaded,sizeof(float)*np); free(loaded); start_iter=opt_load(optpath,M,Vv,np); }
+    if(use_qlion){
+        qlm_init(&g_qlm,&c,&w,P,np); g_q=&g_qlm;   /* reads QLM_OPT itself */
+        char qp[1200]; snprintf(qp,sizeof qp,"%s.q",optpath);
+        if(!fresh && qlm_load(qp,g_q)) printf("[qlm] resumed integer state from %s\n",qp);
+        qlm_render(g_q,P);            /* P is a view of the digits from here on */
+        qlm_report(g_q,np);
+    }
 
     int spe=(int)(ntr/((size_t)B*c.T)); if(spe<1)spe=1;
     int iters=(int)(epochs*spe + 0.5f); if(iters<1)iters=1;
@@ -1448,6 +2347,7 @@ static int cmd_train(int argc, char **argv){
     #ifdef _OPENMP
     nthreads=g_pool_nt>1?g_pool_nt:omp_get_max_threads();
     #endif
+    printf("[train] optimizer=%s\n", qopt);
     printf("[train] model=%s %s params=%zu threads=%d n_mtp=%d batch=%d\n",
            name, fresh?"(fresh)":"(resume)", np, nthreads, c.n_mtp, B);
     printf("[train] data=%s V=%d tok=%zu | epochs=%.2f -> %d iters (steps/epoch=%d) start=%d lr=%g\n",
@@ -1522,8 +2422,65 @@ static int exact_gemv_on(void){
     if(v<0){ const char *e=getenv("TINYLM_EXACT_GEMV"); v = e && *e!='0'; }
     return v;
 }
+/* Phase 2B: true 4-bit weight path (env TINYLM_Q4). Weights are stored packed
+ * 2/byte, 16 bytes per 32-element K-block, one fp32 scale per block -- the same
+ * block layout as int8, half the weight bytes. Activations stay int8, so the
+ * dot unpacks the nibbles to signed int8 in-register and reuses the identical
+ * maddubs/dpbusd accumulation as qdot_row. int8 remains the default; this is a
+ * quality/RAM A/B. Byte packing: byte t = (w[2t]&0xF) | ((w[2t+1]&0xF)<<4),
+ * symmetric [-7,7], sign via two's complement (n>=8 ? n-16 : n). */
+int g_q4=0;
+static void q4_row(const float *x, int K, uint8_t *q, float *s){
+    int nb=(K+31)/32;
+    for(int b=0;b<nb;b++){
+        int off=b*32, g=(off+32<=K)?32:(K-off); float amax=0;
+        for(int j=0;j<g;j++){ float a=fabsf(x[off+j]); if(a>amax)amax=a; }
+        float scale=amax>0?amax/7.0f:1.0f, inv=amax>0?7.0f/amax:0.0f; s[b]=scale;
+        int8_t t[32];
+        for(int j=0;j<g;j++){ int v=(int)lrintf(x[off+j]*inv); if(v>7)v=7; if(v<-7)v=-7; t[j]=(int8_t)v; }
+        for(int j=g;j<32;j++) t[j]=0;
+        uint8_t *o=q+(size_t)b*16;
+        for(int p=0;p<16;p++) o[p]=(uint8_t)((t[2*p]&0x0F)|((t[2*p+1]&0x0F)<<4));
+    }
+}
+static inline float q4dot_row(const uint8_t *wr, const float *ws,
+                              const int8_t *xq, const float *xs, int nb){
+    if(exact_gemv_on()){
+        float a=0.0f;
+        for(int b=0;b<nb;b++){
+            const uint8_t *o=wr+(size_t)b*16; int8_t t[32];
+            for(int p=0;p<16;p++){ int lo=o[p]&0xF, hi=o[p]>>4;
+                if(lo>=8)lo-=16; if(hi>=8)hi-=16; t[2*p]=(int8_t)lo; t[2*p+1]=(int8_t)hi; }
+            a += ws[b]*xs[b]*(float)dot_i8_32(t, xq+(size_t)b*32);
+        }
+        return a;
+    }
+    const __m128i m0f=_mm_set1_epi8(0x0F), eight=_mm_set1_epi8(8);
+    __m256 acc=_mm256_setzero_ps();
+    for(int b=0;b<nb;b++){
+        __m128i v=_mm_loadu_si128((const __m128i*)(wr+(size_t)b*16));
+        __m128i lo=_mm_and_si128(v,m0f);
+        __m128i hi=_mm_and_si128(_mm_srli_epi16(v,4),m0f);
+        lo=_mm_sub_epi8(_mm_xor_si128(lo,eight),eight);   /* (n^8)-8 == n>=8?n-16:n */
+        hi=_mm_sub_epi8(_mm_xor_si128(hi,eight),eight);
+        __m128i b0=_mm_unpacklo_epi8(lo,hi), b1=_mm_unpackhi_epi8(lo,hi);
+        __m256i va=_mm256_set_m128i(b1,b0);               /* lanes w0..w31 in order */
+        __m256i vb=_mm256_loadu_si256((const __m256i*)(xq+(size_t)b*32));
+        __m256i ua=_mm256_sign_epi8(va,va), sb=_mm256_sign_epi8(vb,va);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+        __m256i s=_mm256_dpbusd_epi32(_mm256_setzero_si256(), ua, sb);
+#else
+        __m256i s=_mm256_madd_epi16(_mm256_maddubs_epi16(ua,sb), _mm256_set1_epi16(1));
+#endif
+        acc=_mm256_fmadd_ps(_mm256_set1_ps(ws[b]*xs[b]), _mm256_cvtepi32_ps(s), acc);
+    }
+    __m128 r=_mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc,1));
+    r=_mm_hadd_ps(r,r); r=_mm_hadd_ps(r,r);
+    return _mm_cvtss_f32(r);
+}
 static inline float qdot_row(const int8_t *wr, const float *ws,
                              const int8_t *xq, const float *xs, int nb){
+    if(g_q4) return q4dot_row((const uint8_t*)wr, ws, xq, xs, nb);
     if(exact_gemv_on()){        /* original per-block scalar order, for bit-exact replay */
         float a=0.0f;
         for(int b=0;b<nb;b++)
@@ -1557,13 +2514,19 @@ static void q8_row(const float *x, int K, int8_t *q, float *s){
         for(int j=g;j<32;j++) q[off+j]=0;
     }
 }
-typedef struct { int8_t *q; float *s; } QMat;    /* q:[N][nb*32]  s:[N][nb] */
+typedef struct { int8_t *q; float *s; } QMat;    /* q:[N][rowbytes]  s:[N][nb] */
+/* Weight row stride: int8 keeps 32 bytes/block, q4 packs 2/byte -> 16. The .q
+ * buffer holds int8 or packed-nibbles depending on g_q4; quant_row picks. */
+static inline int rowbytes(int nb){ return g_q4 ? nb*16 : nb*32; }
+static inline void quant_row(const float *x,int K,int8_t *q,float *s){
+    if(g_q4) q4_row(x,K,(uint8_t*)q,s); else q8_row(x,K,q,s);
+}
 static QMat qmat_KN(const float *W, int K, int N){   /* W[K][N] (mm reduces K) -> transpose+quant */
-    int nb=(K+31)/32, kp=nb*32; QMat m;
+    int nb=(K+31)/32, kp=rowbytes(nb); QMat m;
     m.q=malloc((size_t)N*kp); m.s=malloc(sizeof(float)*(size_t)N*nb);
     float *col=malloc(sizeof(float)*K);
     for(int n=0;n<N;n++){ for(int k=0;k<K;k++) col[k]=W[(size_t)k*N+n];
-        q8_row(col,K,m.q+(size_t)n*kp,m.s+(size_t)n*nb); }
+        quant_row(col,K,m.q+(size_t)n*kp,m.s+(size_t)n*nb); }
     free(col); return m;
 }
 /* Q, K and V are three separate [K][*] matrices that all consume the SAME normed
@@ -1572,14 +2535,14 @@ static QMat qmat_KN(const float *W, int K, int N){   /* W[K][N] (mm reduces K) -
  * contiguous weight stream instead of three. */
 static QMat qmat_KN3(const float *Wq, const float *Wk, const float *Wv,
                      int K, int Nq, int Nk, int Nv){
-    int nb=(K+31)/32, kp=nb*32, N=Nq+Nk+Nv; QMat m;
+    int nb=(K+31)/32, kp=rowbytes(nb), N=Nq+Nk+Nv; QMat m;
     m.q=malloc((size_t)N*kp); m.s=malloc(sizeof(float)*(size_t)N*nb);
     float *col=malloc(sizeof(float)*K);
     const float *src[3]={Wq,Wk,Wv}; int cnt[3]={Nq,Nk,Nv}; int o=0;
     for(int t=0;t<3;t++)
         for(int n=0;n<cnt[t];n++,o++){
             for(int k=0;k<K;k++) col[k]=src[t][(size_t)k*cnt[t]+n];
-            q8_row(col,K,m.q+(size_t)o*kp,m.s+(size_t)o*nb);
+            quant_row(col,K,m.q+(size_t)o*kp,m.s+(size_t)o*nb);
         }
     free(col); return m;
 }
@@ -1587,21 +2550,21 @@ static QMat qmat_KN3(const float *Wq, const float *Wk, const float *Wv,
  * the same SwiGLU output element, so this turns two streams 362 KB apart (for
  * the 220M's experts) into one contiguous walk. */
 static QMat qmat_KN_ilv(const float *Wa, const float *Wb, int K, int N){
-    int nb=(K+31)/32, kp=nb*32; QMat m;
+    int nb=(K+31)/32, kp=rowbytes(nb); QMat m;
     m.q=malloc((size_t)2*N*kp); m.s=malloc(sizeof(float)*(size_t)2*N*nb);
     float *col=malloc(sizeof(float)*K);
     for(int n=0;n<N;n++){
         for(int k=0;k<K;k++) col[k]=Wa[(size_t)k*N+n];
-        q8_row(col,K,m.q+(size_t)(2*n)*kp,   m.s+(size_t)(2*n)*nb);
+        quant_row(col,K,m.q+(size_t)(2*n)*kp,   m.s+(size_t)(2*n)*nb);
         for(int k=0;k<K;k++) col[k]=Wb[(size_t)k*N+n];
-        q8_row(col,K,m.q+(size_t)(2*n+1)*kp, m.s+(size_t)(2*n+1)*nb);
+        quant_row(col,K,m.q+(size_t)(2*n+1)*kp, m.s+(size_t)(2*n+1)*nb);
     }
     free(col); return m;
 }
 static QMat qmat_NK(const float *W, int N, int K){   /* W[N][K] (emb) -> quant as-is */
-    int nb=(K+31)/32, kp=nb*32; QMat m;
+    int nb=(K+31)/32, kp=rowbytes(nb); QMat m;
     m.q=malloc((size_t)N*kp); m.s=malloc(sizeof(float)*(size_t)N*nb);
-    for(int n=0;n<N;n++) q8_row(W+(size_t)n*K,K,m.q+(size_t)n*kp,m.s+(size_t)n*nb);
+    for(int n=0;n<N;n++) quant_row(W+(size_t)n*K,K,m.q+(size_t)n*kp,m.s+(size_t)n*nb);
     return m;
 }
 static int8_t *gq_xq=NULL; static float *gq_xs=NULL; static int gq_cap=0;
@@ -1615,10 +2578,10 @@ static void gemv_body(void *p,int lo,int hi,int tid){
 }
 /* Y[N] = X[K] . W  (W pre-quantized, output-major); quantizes X on the fly */
 static void gemv_q8(const QMat *m, const float *X, float *Y, int N, int K){
-    int nb=(K+31)/32, kp=nb*32;
-    if(kp>gq_cap){ gq_xq=realloc(gq_xq,kp); gq_xs=realloc(gq_xs,sizeof(float)*(size_t)nb); gq_cap=kp; }
+    int nb=(K+31)/32, wkp=rowbytes(nb), xkp=nb*32;   /* activations always int8 */
+    if(xkp>gq_cap){ gq_xq=realloc(gq_xq,xkp); gq_xs=realloc(gq_xs,sizeof(float)*(size_t)nb); gq_cap=xkp; }
     q8_row(X,K,gq_xq,gq_xs);
-    GemvJob j={m,gq_xq,gq_xs,Y,nb,kp};
+    GemvJob j={m,gq_xq,gq_xs,Y,nb,wkp};              /* kp = weight row stride */
     /* Dispatch is ~1 us; below ~32 KB of weights the split does not pay it back. */
     if((long)N*K < (32L<<10)) gemv_body(&j,0,N,0);
     else                      tl_for(N, gemv_body, &j);
@@ -1633,21 +2596,21 @@ static void gemv_q8(const QMat *m, const float *X, float *Y, int N, int K){
  * once and the m activations stay in L1.
  *
  * Activations are quantized ONCE up front rather than per row per column. */
-typedef struct { const QMat *mq; const int8_t *xq; const float *xs; float *Y; int m,N,nb,kp; } GemmJob;
+typedef struct { const QMat *mq; const int8_t *xq; const float *xs; float *Y; int m,N,nb,wkp,xkp; } GemmJob;
 static void gemm_body(void *p,int lo,int hi,int tid){
     GemmJob *j=(GemmJob*)p; (void)tid;
     for(int n=lo;n<hi;n++){
-        const int8_t *wr=j->mq->q+(size_t)n*j->kp; const float *ws=j->mq->s+(size_t)n*j->nb;
+        const int8_t *wr=j->mq->q+(size_t)n*j->wkp; const float *ws=j->mq->s+(size_t)n*j->nb;
         for(int i=0;i<j->m;i++)
-            j->Y[(size_t)i*j->N+n]=qdot_row(wr, ws, j->xq+(size_t)i*j->kp, j->xs+(size_t)i*j->nb, j->nb);
+            j->Y[(size_t)i*j->N+n]=qdot_row(wr, ws, j->xq+(size_t)i*j->xkp, j->xs+(size_t)i*j->nb, j->nb);
     }
 }
 static void gemm_q8(const QMat *mq,const float *X,float *Y,int m,int N,int K){
-    int nb=(K+31)/32, kp=nb*32;
-    int8_t *xq=malloc((size_t)m*kp);
+    int nb=(K+31)/32, wkp=rowbytes(nb), xkp=nb*32;
+    int8_t *xq=malloc((size_t)m*xkp);
     float  *xs=malloc(sizeof(float)*(size_t)m*nb);
-    for(int i=0;i<m;i++) q8_row(X+(size_t)i*K,K,xq+(size_t)i*kp,xs+(size_t)i*nb);
-    GemmJob j={mq,xq,xs,Y,m,N,nb,kp};
+    for(int i=0;i<m;i++) q8_row(X+(size_t)i*K,K,xq+(size_t)i*xkp,xs+(size_t)i*nb);
+    GemmJob j={mq,xq,xs,Y,m,N,nb,wkp,xkp};
     tl_for(N, gemm_body, &j);
     free(xq); free(xs);
 }
@@ -1946,7 +2909,7 @@ static Gen *gen_new(const Cfg *c, const Weights *w, int use_q8){
 }
 
 /* Decode-path MoE with int8 experts. Mirrors moe_forward exactly -- same
- * routing, same top-1 gather/scatter, same maths -- but the three expert GEMMs
+ * top-K routing, same gather/scatter, same maths -- but the three expert GEMMs
  * go through mm_dec, so they run int8 when a quantized copy exists.
  * The router stays fp32: it is D x E (512 x 16 here), i.e. 0.004% of the layer,
  * and it decides which expert every token gets, so it is the last thing worth
@@ -1990,28 +2953,28 @@ static void moe_silu_body(void *p,int lo,int hi,int tid){
  * pass -- the separate g/u buffers and the elementwise sweep over them are gone.
  * The activation is quantized once, not once per output column. */
 typedef struct { const QMat *q13; const int8_t *xq; const float *xs; float *out;
-                 int rows,F,nb,kp; } SwigluJob;
+                 int rows,F,nb,wkp,xkp; } SwigluJob;
 static void swiglu_body(void *p,int lo,int hi,int tid){
     SwigluJob *j=(SwigluJob*)p; (void)tid;
-    int nb=j->nb, kp=j->kp, rows=j->rows, F=j->F;
+    int nb=j->nb, wkp=j->wkp, xkp=j->xkp, rows=j->rows, F=j->F;
     for(int n=lo;n<hi;n++){
-        const int8_t *r1=j->q13->q+(size_t)(2*n)*kp, *r3=r1+kp;
+        const int8_t *r1=j->q13->q+(size_t)(2*n)*wkp, *r3=r1+wkp;
         const float  *s1=j->q13->s+(size_t)(2*n)*nb, *s3=s1+nb;
         for(int i=0;i<rows;i++){
-            const int8_t *xq=j->xq+(size_t)i*kp; const float *xs=j->xs+(size_t)i*nb;
+            const int8_t *xq=j->xq+(size_t)i*xkp; const float *xs=j->xs+(size_t)i*nb;
             float a1=qdot_row(r1,s1,xq,xs,nb), a3=qdot_row(r3,s3,xq,xs,nb);
             j->out[(size_t)i*F+n]=siluf(a1)*a3;
         }
     }
 }
 static void swiglu_q8(const QMat *q13, const float *X, float *out, int rows, int D, int F){
-    int nb=(D+31)/32, kp=nb*32;
+    int nb=(D+31)/32, wkp=rowbytes(nb), xkp=nb*32;
     int8_t *xq, *lq=NULL; float *xs, *ls=NULL;
     if(rows==1){ me_qensure(D,F); q8_row(X,D,me_xq,me_xs); xq=me_xq; xs=me_xs; }
-    else { lq=malloc((size_t)rows*kp); ls=malloc(sizeof(float)*(size_t)rows*nb);
-           for(int i=0;i<rows;i++) q8_row(X+(size_t)i*D,D,lq+(size_t)i*kp,ls+(size_t)i*nb);
+    else { lq=malloc((size_t)rows*xkp); ls=malloc(sizeof(float)*(size_t)rows*nb);
+           for(int i=0;i<rows;i++) q8_row(X+(size_t)i*D,D,lq+(size_t)i*xkp,ls+(size_t)i*nb);
            xq=lq; xs=ls; }
-    SwigluJob j={q13,xq,xs,out,rows,F,nb,kp};
+    SwigluJob j={q13,xq,xs,out,rows,F,nb,wkp,xkp};
     tl_for(F, swiglu_body, &j);
     free(lq); free(ls);
 }
@@ -2022,6 +2985,9 @@ static void moe_dn_body(void *p,int lo,int hi,int tid){
         j->out[n]=j->fin[n]+j->gt*qdot_row(j->q2->q+(size_t)n*j->kpF, j->q2->s+(size_t)n*j->nbF,
                                            me_aq, me_as, j->nbF);
 }
+/* Router utilization histogram, opt-in via TINYLM_ROUTER. g_rhist[l*E+e] counts
+ * how many token-slots layer l routed to expert e (all K slots). NULL = off. */
+long *g_rhist=NULL;
 static void moe_forward_q8(const Cfg *c, const Weights *w, const Gen *gn, int l,
                            const float *fnorm, const float *fin, float *out,
                            int N, int *assign, float *gate, float *rprobs){
@@ -2033,42 +2999,51 @@ static void moe_forward_q8(const Cfg *c, const Weights *w, const Gen *gn, int l,
      * 113 tok/s single-threaded. Here the whole expert is TWO regions --
      * {w1,w3,silu} fused into one sweep over F, then w2 -- and everything
      * trivially small (router, top-1, residual add) stays serial. */
+    int K=moe_topk(E);
     if(N==1 && gn->q8){
         me_ensure(1,D,F,E); me_qensure(D,F);
         mm(me_rt, fnorm, w->wr[l], 1, D, E);
         float mx=-1e30f; for(int e=0;e<E;e++) if(me_rt[e]>mx)mx=me_rt[e];
         float s=0; for(int e=0;e<E;e++){ rprobs[e]=expf(me_rt[e]-mx); s+=rprobs[e]; }
-        float inv=1.0f/s; int best=0;
-        for(int e=0;e<E;e++){ rprobs[e]*=inv; if(rprobs[e]>rprobs[best])best=e; }
-        assign[0]=best; gate[0]=rprobs[best];
-        size_t qi=(size_t)l*E+best;
-        const QMat *q2=&gn->qw2[qi];
-        int nbF=(F+31)/32, kpF=nbF*32;
-        swiglu_q8(&gn->qw13[qi], fnorm, me_a, 1, D, F);
-        q8_row(me_a,F,me_aq,me_as);
-        MoeDnJob dj={q2,fin,out,gate[0],nbF,kpF};
-        tl_for(D, moe_dn_body, &dj);
+        float inv=1.0f/s; for(int e=0;e<E;e++) rprobs[e]*=inv;
+        memcpy(out, fin, sizeof(float)*D);           /* residual; slots accumulate onto it */
+        int nbF=(F+31)/32, kpF=rowbytes(nbF);        /* weight row stride (int8 me_aq activation) */
+        for(int k=0;k<K;k++){
+            int best=moe_kth(rprobs,E,k);
+            assign[0]=best; gate[0]=rprobs[best];
+            if(g_rhist) g_rhist[(size_t)l*E+best]++;
+            size_t qi=(size_t)l*E+best;
+            swiglu_q8(&gn->qw13[qi], fnorm, me_a, 1, D, F);
+            q8_row(me_a,F,me_aq,me_as);
+            MoeDnJob dj={&gn->qw2[qi],out,out,rprobs[best],nbF,kpF};  /* fin=out: += onto residual */
+            tl_for(D, moe_dn_body, &dj);
+        }
         return;
     }
     me_ensure(N,D,F,E);
     mm(me_rt, fnorm, w->wr[l], N, D, E);
-    { MoeRtJob rj={assign,gate,rprobs,E};  tl_for(N, moe_rt_body, &rj); }
+    { MoeRtJob rj={assign,gate,rprobs,E};  tl_for(N, moe_rt_body, &rj); }   /* normalizes rprobs */
     memcpy(out, fin, sizeof(float)*(size_t)N*D);
-    for(int e=0;e<E;e++){
-        int ne=0; for(int n=0;n<N;n++) if(assign[n]==e) me_idx[ne++]=n;
-        if(!ne) continue;
-        { MoeGsJob gj={fnorm,NULL,gate,D};  tl_for(ne, moe_gather_body, &gj); }
-        size_t qi=(size_t)l*E+e;
-        /* gen_drop_fp32 nulls w->w1/w3/w2 once the int8 copies exist, so the
-         * fp32 pointers may only be formed on the !q8 branch. */
-        const QMat *q2 = gn->q8?&gn->qw2[qi]:NULL;
-        const float *w2 = gn->q8?NULL:w->w2[l]+(size_t)e*F*D;
-        if(gn->q8) swiglu_q8(&gn->qw13[qi], me_X, me_a, ne, D, F);
-        else { mm(me_g, me_X, w->w1[l]+(size_t)e*D*F, ne, D, F);
-               mm(me_u, me_X, w->w3[l]+(size_t)e*D*F, ne, D, F);
-               tl_for(ne, moe_silu_body, &F); }
-        mm_dec(me_y, me_a, w2, q2, ne, F, D);
-        { MoeGsJob sj={NULL,out,gate,D};   tl_for(ne, moe_scatter_body, &sj); }
+    for(int k=0;k<K;k++){
+        if(k) for(int n=0;n<N;n++){ int sel=moe_kth(rprobs+(size_t)n*E,E,k);
+            assign[n]=sel; gate[n]=rprobs[(size_t)n*E+sel]; }
+        if(g_rhist) for(int n=0;n<N;n++) g_rhist[(size_t)l*E+assign[n]]++;
+        for(int e=0;e<E;e++){
+            int ne=0; for(int n=0;n<N;n++) if(assign[n]==e) me_idx[ne++]=n;
+            if(!ne) continue;
+            { MoeGsJob gj={fnorm,NULL,gate,D};  tl_for(ne, moe_gather_body, &gj); }
+            size_t qi=(size_t)l*E+e;
+            /* gen_drop_fp32 nulls w->w1/w3/w2 once the int8 copies exist, so the
+             * fp32 pointers may only be formed on the !q8 branch. */
+            const QMat *q2 = gn->q8?&gn->qw2[qi]:NULL;
+            const float *w2 = gn->q8?NULL:w->w2[l]+(size_t)e*F*D;
+            if(gn->q8) swiglu_q8(&gn->qw13[qi], me_X, me_a, ne, D, F);
+            else { mm(me_g, me_X, w->w1[l]+(size_t)e*D*F, ne, D, F);
+                   mm(me_u, me_X, w->w3[l]+(size_t)e*D*F, ne, D, F);
+                   tl_for(ne, moe_silu_body, &F); }
+            mm_dec(me_y, me_a, w2, q2, ne, F, D);
+            { MoeGsJob sj={NULL,out,gate,D};   tl_for(ne, moe_scatter_body, &sj); }
+        }
     }
 }
 
@@ -2090,13 +3065,18 @@ static void moe_forward_q8(const Cfg *c, const Weights *w, const Gen *gn, int l,
 static float *gen_drop_fp32(const Cfg *c, Weights *w, float **P){
     if(!P || !*P) return NULL;
     int L=c->L, D=c->D, E=c->n_exp, V=c->V;
-    size_t need=(size_t)V*D + (size_t)L*(2*D + (E>0?(size_t)D*E:0)) + D;
+    size_t need=(size_t)V*D + D
+              + (size_t)L*(2*D + (E>0?(size_t)D*E:0) + (c->qknorm?2*(size_t)c->hd:0));
     float *keep=malloc(sizeof(float)*need), *p=keep;
     if(!keep) return NULL;                       /* keep the fp32 block instead */
     memcpy(p,w->emb,sizeof(float)*(size_t)V*D); w->emb=p; p+=(size_t)V*D;
     for(int l=0;l<L;l++){
         memcpy(p,w->an1[l],sizeof(float)*D); w->an1[l]=p; p+=D;
         memcpy(p,w->an2[l],sizeof(float)*D); w->an2[l]=p; p+=D;
+        if(c->qknorm){
+            memcpy(p,w->qn[l],sizeof(float)*c->hd); w->qn[l]=p; p+=c->hd;
+            memcpy(p,w->kn[l],sizeof(float)*c->hd); w->kn[l]=p; p+=c->hd;
+        }
         if(E>0){ memcpy(p,w->wr[l],sizeof(float)*(size_t)D*E); w->wr[l]=p; p+=(size_t)D*E; }
     }
     memcpy(p,w->nf,sizeof(float)*D); w->nf=p;
@@ -2106,6 +3086,129 @@ static float *gen_drop_fp32(const Cfg *c, Weights *w, float **P){
                           w->w1[l]=w->w3[l]=w->w2[l]=NULL; }
     free(*P); *P=NULL;
     return keep;
+}
+
+/* --- Phase 2A: low-peak TLQ3 loader ---------------------------------------
+ * The default TLQ3 path used to decode the whole selective-q4 file into a full
+ * fp32 param block (537 MB for the 137M model), build int8 QMats from it, then
+ * free it -- a transient 1.2 GB peak just to end up at ~250 MB. This loader
+ * decodes ONE tensor at a time straight into a scratch buffer, builds its int8
+ * QMat, and moves on, so the fp32 block never exists. Output is byte-identical
+ * to the old path: the same bytes decode to the same fp32 values and the same
+ * qmat_* run on them. TINYLM_HIGHPEAK falls back to the old loader. */
+static void f16_gap(Rd *r, float *dst, size_t n){
+    for(size_t k=0;k<n;k++){ uint16_t h; if(!rd(r,&h,2)){fprintf(stderr,"q4 gap\n");exit(1);} dst[k]=f16_to_f32(h); }
+}
+/* One selective-q4 span: fp16 scale + 4-bit nibbles per `group`, reset at j=0
+ * (mirrors q4_selective_decode's inner loop exactly). */
+static void q4_decode_span(Rd *r, float *dst, size_t sn, int group){
+    for(size_t j=0;j<sn;j+=group){
+        int g=(j+(size_t)group<=sn)?group:(int)(sn-j);
+        uint16_t sh; if(!rd(r,&sh,2)){fprintf(stderr,"q4 span scale\n");exit(1);} float scale=f16_to_f32(sh);
+        for(int t=0;t<g;t+=2){
+            uint8_t b; if(!rd(r,&b,1)){fprintf(stderr,"q4 span byte\n");exit(1);}
+            int lo=b&0xF; if(lo>=8)lo-=16; dst[j+t]=(float)lo*scale;
+            if(t+1<g){ int hi=(b>>4)&0xF; if(hi>=8)hi-=16; dst[j+t+1]=(float)hi*scale; }
+        }
+    }
+}
+static Gen *load_q4_lowpeak(const char *path, Cfg *c, Weights *w, Tok **tk_out, float **keep_out){
+    FILE *fp=fopen(path,"rb");
+    if(!fp){fprintf(stderr,"cannot open %s\n",path);exit(1);}
+    size_t rcap=1<<18; uint8_t *rbuf=malloc(rcap);       /* refill window, not the whole file */
+    if(!rbuf){fprintf(stderr,"OOM rbuf\n");exit(1);}
+    Rd r={rbuf,rbuf,fp,rbuf,rcap}; char m[4]; rd(&r,m,4);
+    if(memcmp(m,"TLQ3",4)){fprintf(stderr,"load_q4_lowpeak: not TLQ3\n");exit(1);}
+    int hdr[HDR_MAX]; rd(&r,hdr,4*15); cfg_from_hdr(c,hdr,6);
+    int qtype=0,group=128; rd(&r,&qtype,4); rd(&r,&group,4);
+    check_supported(c,path);
+    *tk_out=NULL;
+
+    int L=c->L,D=c->D,KD=c->KD,F=c->F,V=c->V,hd=c->hd,ne=c->n_exp;
+    int E=n_slots(c);                            /* == n_exp for supported models */
+
+    /* keep block: exactly gen_drop_fp32's layout (emb, per-layer small tensors, nf) */
+    size_t need=(size_t)V*D + D
+              + (size_t)L*(2*(size_t)D + (ne>0?(size_t)D*ne:0) + (c->qknorm?2*(size_t)hd:0));
+    float *keep=malloc(sizeof(float)*need); if(!keep){fprintf(stderr,"OOM keep\n");exit(1);}
+    memset(w,0,sizeof(*w));
+    w->an1=malloc(sizeof(float*)*L); w->an2=malloc(sizeof(float*)*L);
+    w->qn =malloc(sizeof(float*)*L); w->kn =malloc(sizeof(float*)*L);
+    w->wr =malloc(sizeof(float*)*L);
+    w->wq =malloc(sizeof(float*)*L); w->wk =malloc(sizeof(float*)*L);
+    w->wv =malloc(sizeof(float*)*L); w->wo =malloc(sizeof(float*)*L);
+    w->w1 =malloc(sizeof(float*)*L); w->w3 =malloc(sizeof(float*)*L);
+    w->w2 =malloc(sizeof(float*)*L); w->mtp=NULL;
+    float *p=keep;
+    w->emb=p; p+=(size_t)V*D;
+    for(int l=0;l<L;l++){
+        w->an1[l]=p; p+=D; w->an2[l]=p; p+=D;
+        if(c->qknorm){ w->qn[l]=p; p+=hd; w->kn[l]=p; p+=hd; } else { w->qn[l]=NULL; w->kn[l]=NULL; }
+        if(ne>0){ w->wr[l]=p; p+=(size_t)D*ne; } else w->wr[l]=NULL;
+        w->wq[l]=w->wk[l]=w->wv[l]=w->wo[l]=NULL;   /* heavy: int8-only, never dereffed at q8 */
+        w->w1[l]=w->w3[l]=w->w2[l]=NULL;
+    }
+    w->nf=p; p+=D;
+
+    /* two scratch buffers, reused across every matrix. sA holds a whole w1 span
+     * (its experts must persist while w3 streams in to pair with them); sB only
+     * ever holds ONE expert (w3_e / w2_e) or a small attn matrix, since those
+     * spans are consumed expert-by-expert (D*F and F*D are group-aligned). */
+    size_t qkv_n=(size_t)D*D+2*(size_t)D*KD, bigA=(size_t)E*D*F;
+    if(qkv_n>bigA) bigA=qkv_n;
+    size_t bigB=(size_t)D*F; if((size_t)F*D>bigB) bigB=(size_t)F*D;
+    if((size_t)D*D>bigB) bigB=(size_t)D*D;
+    float *sA=malloc(sizeof(float)*bigA), *sB=malloc(sizeof(float)*bigB);
+    if(!sA||!sB){fprintf(stderr,"OOM q4 scratch\n");exit(1);}
+
+    Gen *gn=gen_new(c,w,0);                       /* buffers only, no QMats */
+    gn->qwqkv=malloc(sizeof(QMat)*L); gn->qwo=malloc(sizeof(QMat)*L);
+    gn->qw13=malloc(sizeof(QMat)*(size_t)L*E); gn->qw2=malloc(sizeof(QMat)*(size_t)L*E);
+    if(c->n_mtp>0) gn->qmtp=malloc(sizeof(QMat)*c->n_mtp);
+
+    /* walk the file in byte order (see q4_spans): gap(emb,an1[0]),
+     * per layer [wq wk wv wo | gap(qn,kn,an2,wr) | w1 w3 w2 | gap(an1[l+1])],
+     * trailing gap(nf, mtp). */
+    f16_gap(&r, w->emb, (size_t)V*D);
+    gn->qemb=qmat_NK(w->emb, V, D);
+    f16_gap(&r, w->an1[0], D);
+    for(int l=0;l<L;l++){
+        q4_decode_span(&r, sA,                              (size_t)D*D,  group); /* wq */
+        q4_decode_span(&r, sA+(size_t)D*D,                 (size_t)D*KD, group); /* wk */
+        q4_decode_span(&r, sA+(size_t)D*D+(size_t)D*KD,    (size_t)D*KD, group); /* wv */
+        q4_decode_span(&r, sB,                              (size_t)D*D,  group); /* wo */
+        gn->qwqkv[l]=qmat_KN3(sA, sA+(size_t)D*D, sA+(size_t)D*D+(size_t)D*KD, D, D, KD, KD);
+        gn->qwo[l]  =qmat_KN(sB, D, D);
+        if(c->qknorm){ f16_gap(&r, w->qn[l], hd); f16_gap(&r, w->kn[l], hd); }
+        f16_gap(&r, w->an2[l], D);
+        if(ne>0) f16_gap(&r, w->wr[l], (size_t)D*ne);
+        q4_decode_span(&r, sA, (size_t)E*D*F, group);      /* w1: all experts (kept in sA) */
+        for(int e=0;e<E;e++){                              /* w3: one expert at a time into sB */
+            q4_decode_span(&r, sB, (size_t)D*F, group);    /* D*F is group-aligned -> same bytes */
+            gn->qw13[(size_t)l*E+e]=qmat_KN_ilv(sA+(size_t)e*D*F, sB, D, F);
+        }
+        for(int e=0;e<E;e++){                              /* w2: one expert at a time into sB */
+            q4_decode_span(&r, sB, (size_t)F*D, group);
+            gn->qw2[(size_t)l*E+e]=qmat_KN(sB, F, D);
+        }
+        if(l<L-1) f16_gap(&r, w->an1[l+1], D);
+    }
+    f16_gap(&r, w->nf, D);
+    if(c->n_mtp>0) for(int k=0;k<c->n_mtp;k++){ f16_gap(&r, sA, (size_t)D*D); gn->qmtp[k]=qmat_KN(sA, D, D); }
+    gn->q8=1;
+
+    free(sA); free(sB);
+    int tl=0;
+    if(rd(&r,&tl,4) && tl>0){
+        uint8_t *tb=malloc(tl);                          /* tok blob: drain window, fread the rest */
+        size_t rem=(size_t)(r.end-r.p); if(rem>(size_t)tl) rem=tl;
+        memcpy(tb,r.p,rem); r.p+=rem;
+        if(rem<(size_t)tl) fread(tb+rem,1,(size_t)tl-rem,fp);
+        *tk_out=tok_parse(tb,tl,1); free(tb);
+    }
+    fclose(fp); free(rbuf);
+    *keep_out=keep;
+    return gn;
 }
 
 /* One (row, kv-head, chunk) slice of the attention loop. Extracted from
@@ -2206,6 +3309,7 @@ static void forward_chunk(const Cfg *c, const Weights *w, Gen *gn,
     float scale=1.0f/sqrtf((float)hd); int grp=H/KV;
     for(int j=0;j<m;j++){ memcpy(gn->x+(size_t)j*D, w->emb+(size_t)tokens[j]*D, sizeof(float)*D);
                           gn->posbuf[j]=start_pos+j; }
+    if(w->ng.R>0) ngram_forward(c, &w->ng, tokens, m, start_pos, gn->x);
     for(int l=0;l<c->L;l++){
         rmsnorm_fwd(gn->x, w->an1[l], gn->xn, gn->rinv, m, D);
         /* One fused Q|K|V GEMV, then split the rows back out. The split copies
@@ -2226,6 +3330,10 @@ static void forward_chunk(const Cfg *c, const Weights *w, Gen *gn,
             mm(gn->k, gn->xn, w->wk[l], m, D, KD);
             mm(gn->v, gn->xn, w->wv[l], m, D, KD);
         });
+        if(c->qknorm){
+            qknorm_apply(gn->q, w->qn[l], m, H,  hd);
+            qknorm_apply(gn->k, w->kn[l], m, KV, hd);
+        }
         rope_apply(gn->q, gn->posbuf, m, H,  hd, half, 0);
         rope_apply(gn->k, gn->posbuf, m, KV, hd, half, 0);
         /* The KV ring holds W=c->T entries, but a TLM5 model was TRAINED with a
@@ -2344,14 +3452,32 @@ static float topk_thresh(const float *v, int n, int k, float *h){
  * doubles as the heap, which is finished with before the probabilities land in
  * it). Arithmetically the same as the old five-pass form: exp(l/T - max(l)/T)
  * == exp((l-max(l))/T), and the mask threshold is unchanged. */
-static int sample_logits(const Cfg *c, const float *lg, float *work, float temp, int topk){
+/* CTRL-style repetition penalty (Keskar et al. 2019): each token seen in the last
+ * `rep_win` positions has its logit divided by `rep_pen` if positive, multiplied if
+ * negative -- pushing its probability down either way. Applied once per unique token
+ * (duplicates in the window don't compound, matching HF's behaviour). This is what
+ * breaks the degenerate loops a low-capacity model falls into; it runs on a penalized
+ * COPY (`work`) so the caller's logits row stays intact. `heap` is topk scratch. */
+static int sample_logits(const Cfg *c, const float *lg, float *work, float *heap,
+                         float temp, int topk, const int *hist, int hn,
+                         float rep_pen, int rep_win){
     int V=c->V;
-    if(topk<=1 || temp<=1e-4f) return argmax_v(lg,V);
+    for(int i=0;i<V;i++) work[i]=lg[i];
+    if(rep_pen>1.0f && hn>0){
+        int lo = hn>rep_win ? hn-rep_win : 0;
+        for(int j=lo;j<hn;j++){
+            int t=hist[j]; if(t<0||t>=V) continue;
+            int dup=0; for(int u=lo;u<j;u++) if(hist[u]==t){dup=1;break;}
+            if(dup) continue;
+            work[t] = work[t]>0 ? work[t]/rep_pen : work[t]*rep_pen;
+        }
+    }
+    if(topk<=1 || temp<=1e-4f) return argmax_v(work,V);
     float it = temp>1e-6f?temp:1e-6f;
-    float thr = (topk>0 && topk<V) ? topk_thresh(lg,V,topk,work) : -3.0e38f;
-    float mx=lg[0]; for(int i=1;i<V;i++) if(lg[i]>mx)mx=lg[i];
+    float thr = (topk>0 && topk<V) ? topk_thresh(work,V,topk,heap) : -3.0e38f;
+    float mx=work[0]; for(int i=1;i<V;i++) if(work[i]>mx)mx=work[i];
     float sum=0.0f;
-    for(int i=0;i<V;i++){ float e = lg[i]>=thr ? expf((lg[i]-mx)/it) : 0.0f; work[i]=e; sum+=e; }
+    for(int i=0;i<V;i++){ float e = work[i]>=thr ? expf((work[i]-mx)/it) : 0.0f; work[i]=e; sum+=e; }
     float r=rnd_uniform()*sum, ac=0.0f;
     for(int i=0;i<V;i++){ ac+=work[i]; if(ac>=r) return i; }
     return V-1;
@@ -2385,8 +3511,18 @@ static void run_generation(const Cfg *c, const Weights *w, Gen *gn, const Tok *t
     else                snprintf(fmt,sizeof(fmt),"%s", prompt);
     int pn; int *pids=tok_encode(tk, fmt, &pn);
     rope_init(c, pn + nnew + 8);
-    int spec = (c->n_mtp>0) && (topk<=1 || temp<=1e-4f) && !getenv("TINYLM_NOSPEC");
+    /* repetition penalty (env-tunable, like TINYLM_Q8/NOSPEC). Default on and mild;
+     * TINYLM_REP=1.0 disables. When active, the greedy self-speculative path is off
+     * because its MTP drafting bypasses the sampler where the penalty lives. */
+    const char *rp_env=getenv("TINYLM_REP"); float rep_pen = rp_env?atof(rp_env):1.3f;
+    const char *rw_env=getenv("TINYLM_REPWIN"); int rep_win = rw_env?atoi(rw_env):128;
+    if(rep_pen<1.0f) rep_pen=1.0f;
+    if(getenv("TINYLM_ROUTER") && c->n_exp>0){
+        free(g_rhist); g_rhist=calloc((size_t)c->L*c->n_exp,sizeof(long)); }
+    int spec = (c->n_mtp>0) && (topk<=1 || temp<=1e-4f) && !getenv("TINYLM_NOSPEC") && rep_pen<=1.0f;
     if(echo_prompt){ fputs(fmt,stdout); fflush(stdout); }
+    int *hist=malloc(sizeof(int)*(size_t)(pn+nnew+8)); int hn=0;
+    for(int i=0;i<pn;i++) hist[hn++]=pids[i];
 
     double w0=wtime();
     /* lg_cur tracks the logits row that goes with fn_cur. forward_chunk already
@@ -2422,14 +3558,40 @@ static void run_generation(const Cfg *c, const Weights *w, Gen *gn, const Tok *t
         free(draft);
     } else {
         float *work=malloc(sizeof(float)*c->V);
+        float *heap=malloc(sizeof(float)*(size_t)(topk>0?topk:1));
         while(generated<nnew){
-            int nxt=sample_logits(c, lg_cur, work, temp, topk);
+            int nxt=sample_logits(c, lg_cur, work, heap, temp, topk, hist, hn, rep_pen, rep_win);
             if(stop_eot && nxt==tk->eot) break;
             tok_print(tk,nxt); fflush(stdout); generated++;
+            hist[hn++]=nxt;
             forward_chunk(c,w,gn,&nxt,1,pos); fwd_chunks++; pos++;
             fn_cur=gn->fn; lg_cur=gn->logits;
         }
-        free(work);
+        free(work); free(heap);
+    }
+    free(hist);
+    if(g_rhist){
+        int E=c->n_exp, L=c->L;
+        long tot=0; for(int i=0;i<L*E;i++) tot+=g_rhist[i];
+        long *agg=calloc(E,sizeof(long));
+        for(int l=0;l<L;l++) for(int e=0;e<E;e++) agg[e]+=g_rhist[(size_t)l*E+e];
+        fprintf(stderr,"\n[router] %d experts x %d layers, %ld routing decisions total\n",E,L,tot);
+        double ideal=100.0/E;
+        fprintf(stderr,"[router] aggregate expert usage (ideal %.2f%% each):\n",ideal);
+        int dead=0; double maxp=0; long mx=0;
+        for(int e=0;e<E;e++){ double p=tot?100.0*agg[e]/tot:0; if(p>maxp)maxp=p; if(agg[e]>mx)mx=agg[e];
+            if(agg[e]==0)dead++; }
+        for(int e=0;e<E;e++){ double p=tot?100.0*agg[e]/tot:0;
+            int bar=(int)(p/ideal*20+0.5); if(bar>60)bar=60;
+            char b[64]; int k=0; for(;k<bar&&k<63;k++)b[k]='#'; b[k]=0;
+            fprintf(stderr,"  e%02d %6.2f%% %s\n",e,p,b); }
+        /* Gini + how many experts hold 90% of the mass = collapse indicators */
+        long *srt=malloc(E*sizeof(long)); memcpy(srt,agg,E*sizeof(long));
+        for(int i=0;i<E;i++)for(int j=i+1;j<E;j++)if(srt[j]>srt[i]){long t=srt[i];srt[i]=srt[j];srt[j]=t;}
+        long cum=0; int n90=0; for(;n90<E;){ cum+=srt[n90]; n90++; if(tot&&cum>=tot*9/10)break; }
+        fprintf(stderr,"[router] dead experts: %d/%d | busiest %.2f%% | top %d experts carry 90%% of tokens\n",
+                dead,E,maxp,n90);
+        free(agg); free(srt); free(g_rhist); g_rhist=NULL;
     }
     double dt=wtime()-w0; if(dt<1e-9)dt=1e-9;
     prof_report(dt);
@@ -2519,8 +3681,9 @@ static int cmd_score(int argc, char **argv){
     if(!tk){ fprintf(stderr,"'%s' has no bundled tokenizer\n",path); return 1; }
     int use_q8=getenv("TINYLM_Q8")!=NULL;
     { FILE *qf=fopen(path,"rb"); if(qf){ char mg[4]={0}; if(fread(mg,1,4,qf)==4 &&
-        (!memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4))) use_q8=1; fclose(qf); } }
-    Weights w; map_weights(&c,P,&w); Gen *gn=gen_new(&c,&w,use_q8);
+        (!memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4))) use_q8=1; fclose(qf); } }
+    Weights w; map_weights(&c,P,&w); memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng);
+    Gen *gn=gen_new(&c,&w,use_q8);
     /* every heavy tensor now has an int8 copy -- drop the fp32 block */
     float *kept = gn->q8 ? gen_drop_fp32(&c,&w,&P) : NULL; (void)kept;
     rope_init(&c, c.T+8);
@@ -2585,15 +3748,29 @@ static int cmd_run(int argc, char **argv){
     const char *arg=argv[2];
     char path[1024]; model_path(arg, path, sizeof(path));
     FILE *e=fopen(path,"rb"); if(e) fclose(e); else snprintf(path,sizeof(path),"%s",arg);
-    Cfg c; Tok *tk=NULL; float *P=model_load_full(path,&c,&tk);
+    char mg[4]={0}; { FILE *qf=fopen(path,"rb"); if(qf){ if(fread(mg,1,4,qf)!=4) mg[0]=0; fclose(qf); } }
+    int is_tlq3 = !memcmp(mg,"TLQ3",4);
+    /* Phase 2B: TINYLM_Q4 makes the low-peak loader build true 4-bit QMats
+     * (half the weight RAM) instead of int8. int8 remains the default. Only the
+     * low-peak TLQ3 path honours it. */
+    g_q4 = is_tlq3 && !getenv("TINYLM_HIGHPEAK") && getenv("TINYLM_Q4")!=NULL;
+    Cfg c; Tok *tk=NULL; Weights w; Gen *gn; float *P=NULL, *kept=NULL;
+    if(is_tlq3 && !getenv("TINYLM_HIGHPEAK")){
+        /* low-peak: decode tensor-by-tensor straight into QMats (Phase 2A/2B) */
+        gn=load_q4_lowpeak(path,&c,&w,&tk,&kept);
+        memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng);
+    } else {
+        P=model_load_full(path,&c,&tk);
+        int use_q8=getenv("TINYLM_Q8")!=NULL;
+        if(!memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4)) use_q8=1;
+        map_weights(&c,P,&w); memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng);
+        gn=gen_new(&c,&w,use_q8);
+        /* every heavy tensor now has an int8 copy -- drop the fp32 block */
+        kept = gn->q8 ? gen_drop_fp32(&c,&w,&P) : NULL;
+    }
+    (void)kept;
     if(!tk){ fprintf(stderr,"'%s' has no bundled tokenizer (untrained?).\n"
                             "  train it:  tinylm train %s <data_dir> <epochs>\n", path, arg); return 1; }
-    int use_q8=getenv("TINYLM_Q8")!=NULL;
-    { FILE *qf=fopen(path,"rb"); if(qf){ char mg[4]={0}; if(fread(mg,1,4,qf)==4 &&
-        (!memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4))) use_q8=1; fclose(qf); } }
-    Weights w; map_weights(&c,P,&w); Gen *gn=gen_new(&c,&w,use_q8);
-    /* every heavy tensor now has an int8 copy -- drop the fp32 block */
-    float *kept = gn->q8 ? gen_drop_fp32(&c,&w,&P) : NULL; (void)kept;
 
     int interactive=0; const char *prompt=NULL; int ai=3;
     if(argc>3 && (!strcmp(argv[3],"-i")||!strcmp(argv[3],"--interactive")||!strcmp(argv[3],"+interactive"))){
@@ -2619,7 +3796,8 @@ static int cmd_run(int argc, char **argv){
         }
         printf("[bye]\n");
     } else {
-        printf("[tinylm] %s | temp=%.2f topk=%d\n", arg, temp, topk);
+        printf("[tinylm] %s | temp=%.2f topk=%d | decode=%s\n", arg, temp, topk,
+               g_q4?"int4":(gn->q8?"int8":"fp32"));
         printf("------------------------------------------------------------\n");
         run_generation(&c,&w,gn,tk, prompt, n, temp, topk, 1, /*echo*/1, /*stats*/1);
     }
@@ -2656,9 +3834,6 @@ static int chat_stop_at(const char *s, int len, int from){
     }
     return -1;
 }
-/* chat_sample is now just sample_logits; kept as a name because cmd_chat reads
- * better with it. */
-#define chat_sample(c,lg,work,temp,topk) sample_logits((c),(lg),(work),(temp),(topk))
 
 static int cmd_chat(int argc, char **argv){
     if(argc<3){ fprintf(stderr,
@@ -2672,14 +3847,18 @@ static int cmd_chat(int argc, char **argv){
     if(!tk){ fprintf(stderr,"'%s' has no bundled tokenizer.\n",path); return 1; }
     int use_q8=getenv("TINYLM_Q8")!=NULL;
     { FILE *qf=fopen(path,"rb"); if(qf){ char mg[4]={0}; if(fread(mg,1,4,qf)==4 &&
-        (!memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4))) use_q8=1; fclose(qf); } }
-    Weights w; map_weights(&c,P,&w); Gen *gn=gen_new(&c,&w,use_q8);
+        (!memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4))) use_q8=1; fclose(qf); } }
+    Weights w; map_weights(&c,P,&w); memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng);
+    Gen *gn=gen_new(&c,&w,use_q8);
     /* every heavy tensor now has an int8 copy -- drop the fp32 block */
     float *kept = gn->q8 ? gen_drop_fp32(&c,&w,&P) : NULL; (void)kept;
 
     int nmax  = argc>3?atoi(argv[3]):256;
     float temp= argc>4?atof(argv[4]):0.8f;
     int topk  = argc>5?atoi(argv[5]):40;
+    const char *rp_env=getenv("TINYLM_REP"); float rep_pen = rp_env?atof(rp_env):1.3f;
+    const char *rw_env=getenv("TINYLM_REPWIN"); int rep_win = rw_env?atoi(rw_env):128;
+    if(rep_pen<1.0f) rep_pen=1.0f;
 
     /* Absolute positions keep climbing across turns, so the RoPE tables must
      * cover more than one context. Past this budget the session is reset. */
@@ -2700,6 +3879,9 @@ static int cmd_chat(int argc, char **argv){
     printf("Type a message. /reset clears context, /quit exits.\n");
 
     float *work=(float*)malloc(sizeof(float)*c.V);
+    float *heap=(float*)malloc(sizeof(float)*(size_t)(topk>0?topk:1));
+    int   *hist=(int*)malloc(sizeof(int)*(size_t)ropemax);
+    int    hn=0;
     char  *resp=(char*)malloc(CHAT_RESP);
     char   line[16384], fmt[16640];
     int pos=0;
@@ -2710,11 +3892,11 @@ static int cmd_chat(int argc, char **argv){
         size_t L=strlen(line); while(L && (line[L-1]=='\n'||line[L-1]=='\r')) line[--L]=0;
         if(L==0) continue;
         if(!strcmp(line,"/quit")||!strcmp(line,"/exit")) break;
-        if(!strcmp(line,"/reset")){ pos=0; printf("[context cleared]\n"); continue; }
+        if(!strcmp(line,"/reset")){ pos=0; hn=0; printf("[context cleared]\n"); continue; }
 
         /* Position budget: a rough token estimate is enough, the reset is cheap. */
         if(pos + (int)(L/2) + nmax + 32 > ropemax){
-            pos=0; printf("[context full - starting fresh]\n");
+            pos=0; hn=0; printf("[context full - starting fresh]\n");
         }
         if(c.tmpl==2)      snprintf(fmt,sizeof(fmt),"<|user|>\n%s\n<|assistant|>\n",line);
         else if(c.tmpl==1) snprintf(fmt,sizeof(fmt),"### Instruction:\n%s\n\n### Response:\n",line);
@@ -2725,6 +3907,7 @@ static int cmd_chat(int argc, char **argv){
         for(int i=0;i<pn;){ int m=pn-i; if(m>c.T)m=c.T;
             forward_chunk(&c,&w,gn,pids+i,m,pos);
             lg_cur=gn->logits+(size_t)(m-1)*c.V; pos+=m; i+=m; }
+        for(int i=0;i<pn && hn<ropemax;i++) hist[hn++]=pids[i];
         free(pids);
         if(!lg_cur) continue;
 
@@ -2732,8 +3915,9 @@ static int cmd_chat(int argc, char **argv){
         int rlen=0, printed=0, gen=0, cut=-1;
         double t0=wtime();
         while(gen<nmax){
-            int nxt=chat_sample(&c, lg_cur, work, temp, topk);   /* forward_chunk already ran the head */
+            int nxt=sample_logits(&c, lg_cur, work, heap, temp, topk, hist, hn, rep_pen, rep_win);
             if(nxt==tk->eot) break;
+            if(hn<ropemax) hist[hn++]=nxt;
             int dl=tk->declen[nxt];
             if(rlen+dl >= CHAT_RESP) break;
             memcpy(resp+rlen, tk->dec[nxt], dl); rlen+=dl; gen++;
@@ -2750,7 +3934,7 @@ static int cmd_chat(int argc, char **argv){
         fflush(stdout);
     }
     printf("\n[bye]\n");
-    free(work); free(resp);
+    free(work); free(heap); free(hist); free(resp);
     return 0;
 }
 
@@ -2761,18 +3945,22 @@ static int cmd_chat(int argc, char **argv){
  * bundled tokenizer/template so the quantized file still runs standalone. */
 static int cmd_quantize(int argc, char **argv){
     if(argc<4){ fprintf(stderr,
-        "usage: tinylm quantize <in_model.bin> <out_model.bin> [fp16|q8]\n"
+        "usage: tinylm quantize <in_model.bin> <out_model.bin> [fp16|q8|q4]\n"
         "  fp16  half precision, ~2x smaller, near-lossless (default)\n"
         "  q8    8-bit blocks (group 64), ~3.8x smaller, slightly lossy\n"
+        "  q4    4-bit blocks (group 128, symmetric [-7,7]), ~7.5x smaller (matches QAT)\n"
         "  Loading dequantizes to fp32 -> compute/quality at run time is that of the\n"
         "  stored precision; the file just takes less disk. Tokenizer is preserved.\n"); return 1; }
     const char *in=argv[2], *out=argv[3];
-    int qtype = (argc>4 && (!strcmp(argv[4],"q8")||!strcmp(argv[4],"int8"))) ? 1 : 0;
-    int group = 64;
+    int qtype=0, group=64;
+    if(argc>4){
+        if(!strcmp(argv[4],"q8")||!strcmp(argv[4],"int8")) qtype=1;
+        else if(!strcmp(argv[4],"q4")||!strcmp(argv[4],"int4")){ qtype=2; group=128; }
+    }
     size_t flen; uint8_t *buf=read_file(in,&flen);
     if(!buf){ fprintf(stderr,"cannot open %s\n",in); return 1; }
     Rd r={buf,buf+flen}; char m[4]; rd(&r,m,4);
-    if(!memcmp(m,"TLQ1",4)||!memcmp(m,"TLQ2",4)){ fprintf(stderr,"%s is already quantized\n",in); free(buf); return 1; }
+    if(!memcmp(m,"TLQ1",4)||!memcmp(m,"TLQ2",4)||!memcmp(m,"TLQ3",4)){ fprintf(stderr,"%s is already quantized\n",in); free(buf); return 1; }
     int ver, nh=hdr_ints(m,&ver);
     if(!nh){ fprintf(stderr,"%s: not a tinylm model\n",in); free(buf); return 1; }
     int hdr[HDR_MAX]; if(!rd(&r,hdr,4*nh)){ fprintf(stderr,"bad header\n"); free(buf); return 1; }
@@ -2782,29 +3970,42 @@ static int cmd_quantize(int argc, char **argv){
     int tl=0; uint8_t *blob=NULL;
     if(ver>=2 && rd(&r,&tl,4) && tl>0) blob=r.p;      /* points into buf (still alive) */
 
-    size_t qlen; uint8_t *q=quantize_params(P,n,qtype,group,&qlen);
+    /* q4 uses selective spans (stored qtype=3): only linear projections get 4-bit,
+       sensitive gaps stay fp16, matching the QAT layout. */
+    int wtype=qtype; size_t qlen; uint8_t *q;
+    if(qtype==2){ q=q4_selective_encode(P,n,&c,group,&qlen); wtype=3; }
+    else q=quantize_params(P,n,qtype,group,&qlen);
     /* measure the quantization error (dequantize back and compare) */
-    float *P2=fz(n); Rd rq={q,q+qlen}; dequantize_params(&rq,P2,n,qtype,group);
+    float *P2=fz(n); Rd rq={q,q+qlen};
+    if(wtype==3) q4_selective_decode(&rq,P2,n,&c,group);
+    else dequantize_params(&rq,P2,n,qtype,group);
     double maxe=0,sume=0,sumx=0;
     for(size_t i=0;i<n;i++){ double e=fabs((double)P[i]-(double)P2[i]);
         if(e>maxe)maxe=e; sume+=e; sumx+=fabs((double)P[i]); }
 
     FILE *f=fopen(out,"wb"); if(!f){ fprintf(stderr,"cannot write %s\n",out); return 1; }
-    /* Same TLM4/TLM5 split as model_save_bundle: TLQ2 when there is a window. */
-    if(c.win>0){
+    /* Selective q4 (wtype==3) is stamped TLQ3 (qver6, 15 ints) so the magic
+     * matches the content -- the low-peak/int4 run paths gate on the magic.
+     * Otherwise the TLM4/TLM5 split: TLQ2 when there is a window, else TLQ1. */
+    if(wtype==3){
+        int oh[15]={c.V,c.D,c.L,c.H,c.KV,c.F,c.T,c.eot,c.tmpl,c.n_mtp,c.n_exp,
+                    c.win,c.full_every,c.n_shared,c.qknorm};
+        fwrite("TLQ3",1,4,f); fwrite(oh,4,15,f);
+    } else if(c.win>0){
         int oh[13]={c.V,c.D,c.L,c.H,c.KV,c.F,c.T,c.eot,c.tmpl,c.n_mtp,c.n_exp,c.win,c.full_every};
         fwrite("TLQ2",1,4,f); fwrite(oh,4,13,f);
     } else {
         int oh[11]={c.V,c.D,c.L,c.H,c.KV,c.F,c.T,c.eot,c.tmpl,c.n_mtp,c.n_exp};
         fwrite("TLQ1",1,4,f); fwrite(oh,4,11,f);
     }
-    fwrite(&qtype,4,1,f); fwrite(&group,4,1,f);
+    fwrite(&wtype,4,1,f); fwrite(&group,4,1,f);
     fwrite(q,1,qlen,f);
     fwrite(&tl,4,1,f); if(tl>0&&blob) fwrite(blob,1,tl,f);
     fclose(f);
 
-    double insz=(double)flen, outsz=4+44+8+(double)qlen+4+tl;
-    printf("[quantize] %s -> %s  (%s, %zu params)\n", in, out, qtype?"q8":"fp16", n);
+    int hbytes=(wtype==3?15:c.win>0?13:11)*4;
+    double insz=(double)flen, outsz=4+hbytes+8+(double)qlen+4+tl;
+    printf("[quantize] %s -> %s  (%s, %zu params)\n", in, out, qtype==2?"q4":qtype==1?"q8":"fp16", n);
     printf("[quantize] %.2f MB -> %.2f MB  (%.2fx smaller) | max|err| %.2e, mean-rel %.2e | tok %s\n",
            insz/1e6, outsz/1e6, insz/outsz, maxe, sumx>0?sume/sumx:0.0, tl>0?"kept":"none");
     printf("[quantize] run it:  tinylm run %s   (loads = dequantized fp32)\n", out);
@@ -2997,7 +4198,7 @@ static int cmd_bench(int argc, char **argv){
     rope_init(&c, c.T);
     size_t np=param_count(&c);
     float *P=fz(np),*G=fz(np),*M=fz(np),*Vv=fz(np);
-    Weights w,gr; map_weights(&c,P,&w); map_weights(&c,G,&gr);
+    Weights w,gr; map_weights(&c,P,&w); map_weights(&c,G,&gr); memset(&w.ng,0,sizeof(w.ng)); memset(&gr.ng,0,sizeof(gr.ng));
     init_params(&c,&w);
     Acts *a=acts_new(&c,B);
     int N=B*c.T; int *tok=malloc(sizeof(int)*N),*tgt=malloc(sizeof(int)*N);
@@ -3086,7 +4287,10 @@ static void set_ftz(void){
 #endif
 }
 int main(int argc, char **argv){
-    g_rng ^= (uint64_t)time(NULL);
+    { const char *sd=getenv("TINYLM_SEED");   /* pin the batch order so two runs
+           see identical data -- required for any A/B to mean anything */
+      if(sd) g_rng = (uint64_t)strtoull(sd,NULL,10) | 1ULL;
+      else   g_rng ^= (uint64_t)time(NULL); }
     set_ftz();
 #ifdef _OPENMP
     /* Default to PHYSICAL cores, not logical. Decode is FMA- and L1-bound, so
