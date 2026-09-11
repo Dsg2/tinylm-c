@@ -2114,6 +2114,178 @@ static int ngram_load(const char *base_path, const Cfg *c, Ng *ng){
     free(buf); return 1;
 fail: free(buf); free(ng->Wng); free(ng->d); free(ng->s); memset(ng,0,sizeof(*ng)); return 0;
 }
+
+/* ------------------------------ GGUF reader ------------------------------
+ * Loads a tinylm-native GGUF produced by `bin2gguf.py --target tinylm`:
+ * one flat `tinylm.params` tensor (F32 or F16), the raw TLTK blob as
+ * `tinylm.tokenizer` (I8), and optional ngram tensors (wng/digits/scales) with
+ * an int32 `tinylm.ngram` meta array. Everything is a near-memcpy dequant: the
+ * writer stores tensors in the exact checkpoint order map_weights() expects, so
+ * there is no transpose / rope-permute / pad inversion here (unlike the llama
+ * target). Returns malloc'd fp32 params (nelem == n_params); fills *c via
+ * cfg_from_hdr(...,6), *tk_out via tok_parse(), and *ng_out from the ngram
+ * tensors (zeroed if the file has none). NULL on any malformed input. */
+#define GG_F32 0
+#define GG_F16 1
+#define GG_I8  24
+#define GGUF_ALIGN 32
+typedef struct { char name[64]; uint32_t ttype; uint64_t off; uint64_t nelem; } GgTinfo;
+static uint32_t gg_u32(const uint8_t *p){ uint32_t v; memcpy(&v,p,4); return v; }
+static uint64_t gg_u64(const uint8_t *p){ uint64_t v; memcpy(&v,p,8); return v; }
+static size_t gg_scalar_size(uint32_t t){
+    switch(t){ case 0: case 1: case 7: return 1; case 2: case 3: return 2;
+               case 4: case 5: case 6: return 4; case 10: case 11: case 12: return 8;
+               default: return 0; }  /* 8=string, 9=array handled by caller */
+}
+/* advance r->p past one KV value of the given vtype; 0 on overrun/unknown type */
+static int gg_skip_value(const uint8_t **pp, const uint8_t *end, uint32_t vtype){
+    const uint8_t *p=*pp;
+    if(vtype==8){ if(p+8>end) return 0; uint64_t n=gg_u64(p); p+=8;
+                  if(p+n>end) return 0; p+=n; *pp=p; return 1; }
+    if(vtype==9){ if(p+12>end) return 0; uint32_t et=gg_u32(p); p+=4;
+                  uint64_t cnt=gg_u64(p); p+=8;
+                  if(et==8){ for(uint64_t i=0;i<cnt;i++){ if(p+8>end) return 0;
+                             uint64_t n=gg_u64(p); p+=8; if(p+n>end) return 0; p+=n; }
+                             *pp=p; return 1; }
+                  size_t es=gg_scalar_size(et); if(!es) return 0;
+                  if((uint64_t)(end-p) < es*cnt) return 0; p+=es*cnt; *pp=p; return 1; }
+    size_t s=gg_scalar_size(vtype); if(!s) return 0;
+    if(p+s>end) return 0; p+=s; *pp=p; return 1;
+}
+static GgTinfo *gguf_find(GgTinfo *ts, uint64_t n, const char *nm){
+    for(uint64_t i=0;i<n;i++) if(!strcmp(ts[i].name,nm)) return &ts[i];
+    return NULL;
+}
+static float *gguf_load_full(const char *path, Cfg *c, Tok **tk_out, Ng *ng_out, int *quant_out){
+    if(tk_out) *tk_out=NULL;
+    if(ng_out) memset(ng_out,0,sizeof(*ng_out));
+    if(quant_out) *quant_out=0;
+    int qtype=-1, group=0;
+    size_t len; uint8_t *buf=read_file(path,&len);
+    if(!buf){ fprintf(stderr,"cannot open %s\n",path); return NULL; }
+    const uint8_t *end=buf+len, *p=buf;
+    if(len<24 || memcmp(buf,"GGUF",4)){ fprintf(stderr,"not a GGUF file: %s\n",path); free(buf); return NULL; }
+    p+=4;
+    uint32_t ver=gg_u32(p); p+=4;
+    uint64_t n_tensors=gg_u64(p); p+=8;
+    uint64_t n_kv=gg_u64(p); p+=8;
+    if(ver!=3){ fprintf(stderr,"unsupported GGUF version %u\n",ver); free(buf); return NULL; }
+
+    int have_cfg=0, hdr[15]={0}, has_ng=0, ngmeta[5]={0};
+    for(uint64_t i=0;i<n_kv;i++){
+        if(p+8>end) goto bad;
+        uint64_t kl=gg_u64(p); p+=8;
+        if((uint64_t)(end-p) < kl+4) goto bad;
+        const char *key=(const char*)p; p+=kl;
+        uint32_t vtype=gg_u32(p); p+=4;
+        const uint8_t *v=p;
+        if(kl==10 && !memcmp(key,"tinylm.cfg",10) && vtype==9){
+            if(v+12<=end && gg_u32(v)==5){ uint64_t cnt=gg_u64(v+4);
+                int nn=cnt>15?15:(int)cnt;
+                if(v+12+4*(uint64_t)nn<=end){ for(int j=0;j<nn;j++) hdr[j]=(int)gg_u32(v+12+4*j); have_cfg=1; } }
+        } else if(kl==15 && !memcmp(key,"tinylm.n_params",15) && vtype==4){
+            /* n_params validated against tinylm.params tensor below */
+        } else if(kl==12 && !memcmp(key,"tinylm.qtype",12) && vtype==4){
+            if(v+4<=end) qtype=(int)gg_u32(v);
+        } else if(kl==12 && !memcmp(key,"tinylm.group",12) && vtype==4){
+            if(v+4<=end) group=(int)gg_u32(v);
+        } else if(kl==16 && !memcmp(key,"tinylm.has_ngram",16) && vtype==7){
+            has_ng = v<end ? v[0]!=0 : 0;
+        } else if(kl==12 && !memcmp(key,"tinylm.ngram",12) && vtype==9){
+            if(v+12<=end && gg_u32(v)==5){ uint64_t cnt=gg_u64(v+4);
+                int nn=cnt>5?5:(int)cnt;
+                if(v+12+4*(uint64_t)nn<=end) for(int j=0;j<nn;j++) ngmeta[j]=(int)gg_u32(v+12+4*j); }
+        }
+        if(!gg_skip_value(&p,end,vtype)) goto bad;
+    }
+    if(!have_cfg){ fprintf(stderr,"GGUF missing tinylm.cfg\n"); goto bad; }
+
+    GgTinfo *ts=(GgTinfo*)calloc(n_tensors?n_tensors:1,sizeof(GgTinfo));
+    for(uint64_t i=0;i<n_tensors;i++){
+        if(p+8>end){ free(ts); goto bad; }
+        uint64_t nl=gg_u64(p); p+=8;
+        if((uint64_t)(end-p) < nl+4){ free(ts); goto bad; }
+        size_t cpy=nl<63?nl:63; memcpy(ts[i].name,p,cpy); ts[i].name[cpy]=0; p+=nl;
+        uint32_t ndim=gg_u32(p); p+=4;
+        uint64_t nel=1;
+        for(uint32_t d=0;d<ndim;d++){ if(p+8>end){ free(ts); goto bad; } nel*=gg_u64(p); p+=8; }
+        if(p+12>end){ free(ts); goto bad; }
+        ts[i].ttype=gg_u32(p); p+=4;
+        ts[i].off=gg_u64(p); p+=8;
+        ts[i].nelem=nel;
+    }
+    size_t data_base=(((size_t)(p-buf))+GGUF_ALIGN-1)&~((size_t)GGUF_ALIGN-1);
+
+    /* config */
+    cfg_from_hdr(c,hdr,6);
+
+    /* params: a quantized checkpoint carries the raw quant body in
+     * tinylm.qparams (I8); dequantize it exactly as model_load_full() does so
+     * gen_new(use_q8=1) re-quantizes to the same int8 GEMV inputs as the .bin. */
+    float *P; size_t n_par=param_count(c);
+    if(qtype>=0){
+        GgTinfo *tq=gguf_find(ts,n_tensors,"tinylm.qparams");
+        if(!tq){ fprintf(stderr,"GGUF missing tinylm.qparams\n"); free(ts); goto bad; }
+        size_t qb=(size_t)tq->nelem;
+        const uint8_t *qd=buf+data_base+tq->off;
+        if((uint64_t)(end-qd) < qb){ free(ts); goto bad; }
+        P=fz(n_par);
+        Rd r={qd,qd+qb};
+        int ok = qtype==3 ? q4_selective_decode(&r,P,n_par,c,group)
+                          : dequantize_params(&r,P,n_par,qtype,group);
+        if(!ok){ fprintf(stderr,"GGUF quant body decode failed\n"); free(P); free(ts); goto bad; }
+        if(quant_out) *quant_out=1;
+    } else {
+        GgTinfo *tp=gguf_find(ts,n_tensors,"tinylm.params");
+        if(!tp){ fprintf(stderr,"GGUF missing tinylm.params\n"); free(ts); goto bad; }
+        size_t np=(size_t)tp->nelem;
+        P=(float*)malloc(np*sizeof(float));
+        const uint8_t *pd=buf+data_base+tp->off;
+        if(tp->ttype==GG_F32){
+            if((uint64_t)(end-pd) < (uint64_t)np*4){ free(P); free(ts); goto bad; }
+            memcpy(P,pd,np*sizeof(float));
+        } else if(tp->ttype==GG_F16){
+            if((uint64_t)(end-pd) < (uint64_t)np*2){ free(P); free(ts); goto bad; }
+            const uint16_t *h=(const uint16_t*)pd;
+            for(size_t i=0;i<np;i++) P[i]=f16_to_f32(h[i]);
+        } else { fprintf(stderr,"unsupported tinylm.params type %u\n",tp->ttype); free(P); free(ts); goto bad; }
+    }
+
+    /* tokenizer */
+    GgTinfo *tt=gguf_find(ts,n_tensors,"tinylm.tokenizer");
+    if(tt && tk_out){
+        const uint8_t *td=buf+data_base+tt->off;
+        if((uint64_t)(end-td) >= tt->nelem) *tk_out=tok_parse(td,(size_t)tt->nelem,1);
+    }
+
+    /* ngram */
+    if(has_ng && ng_out){
+        GgTinfo *gw=gguf_find(ts,n_tensors,"tinylm.ngram.wng");
+        GgTinfo *gd=gguf_find(ts,n_tensors,"tinylm.ngram.digits");
+        GgTinfo *gs=gguf_find(ts,n_tensors,"tinylm.ngram.scales");
+        if(gw&&gd&&gs){
+            size_t nw=(size_t)gw->nelem, nd=(size_t)gd->nelem, ns=(size_t)gs->nelem;
+            const uint8_t *wd=buf+data_base+gw->off, *dd=buf+data_base+gd->off, *sd=buf+data_base+gs->off;
+            if((uint64_t)(end-wd)>=(uint64_t)nw*4 && (uint64_t)(end-dd)>=nd && (uint64_t)(end-sd)>=(uint64_t)ns*4){
+                Ng *ng=ng_out;
+                ng->R=ngmeta[0]; ng->De=ngmeta[1]; ng->order=ngmeta[2];
+                ng->group=ngmeta[3]?ngmeta[3]:128; ng->ngrp=ngmeta[4];
+                ng->Wng=(float*)malloc(nw*sizeof(float));
+                ng->d=(signed char*)malloc(nd?nd:1);
+                ng->s=(float*)malloc(ns*sizeof(float));
+                memcpy(ng->Wng,wd,nw*sizeof(float));
+                memcpy(ng->d,dd,nd);
+                memcpy(ng->s,sd,ns*sizeof(float));
+                ng->sref=1.0f; ng->fs=NULL; ng->doff=0;  /* sref unused at inference */
+            }
+        }
+    }
+    free(ts); free(buf);
+    return P;
+bad:
+    free(buf);
+    return NULL;
+}
 /* AdamW state sidecar (<out>.opt): magic, iter, then M[n], V[n] */
 static void opt_save(const char *path, int iter, const float *M, const float *Vv, size_t n){
     FILE *f=fopen(path,"wb"); if(!f) return;
@@ -3615,11 +3787,18 @@ static int cmd_gen(int argc, char **argv){
     if(!mf){ fprintf(stderr,"cannot open %s\n",argv[2]); return 1; }
     if(fread(mg,1,4,mf)!=4){ fclose(mf); fprintf(stderr,"bad model %s\n",argv[2]); return 1; }
     fclose(mf);
+    int is_gguf = !memcmp(mg,"GGUF",4);
     int bundled = !memcmp(mg,"TLM2",4) || !memcmp(mg,"TLM3",4)
                || !memcmp(mg,"TLM4",4) || !memcmp(mg,"TLM5",4)
                || !memcmp(mg,"TLQ1",4) || !memcmp(mg,"TLQ2",4);
     Cfg c; float *P; Tok *tk; const char *prompt; int ai;
-    if(bundled){
+    Ng gg_ng; memset(&gg_ng,0,sizeof(gg_ng)); int gg_quant=0;
+    if(is_gguf){
+        P=gguf_load_full(argv[2],&c,&tk,&gg_ng,&gg_quant);
+        if(!P){ fprintf(stderr,"failed to load GGUF %s\n",argv[2]); return 1; }
+        if(!tk){ fprintf(stderr,"GGUF has no tokenizer\n"); return 1; }
+        prompt=argv[3]; ai=4;
+    } else if(bundled){
         P=model_load_full(argv[2],&c,&tk);
         if(!tk){ fprintf(stderr,"bundle has no tokenizer; re-pack it\n"); return 1; }
         prompt=argv[3]; ai=4;
@@ -3632,8 +3811,11 @@ static int cmd_gen(int argc, char **argv){
     float temp= argc>ai+1?atof(argv[ai+1]):0.8f;
     int topk  = argc>ai+2?atoi(argv[ai+2]):40;
     int stop_eot = argc>ai+3?atoi(argv[ai+3]):1;
-    int use_q8 = !memcmp(mg,"TLQ1",4) || !memcmp(mg,"TLQ2",4) || getenv("TINYLM_Q8")!=NULL;
-    Weights w; map_weights(&c,P,&w); Gen *gn=gen_new(&c,&w,use_q8);
+    int use_q8 = is_gguf ? gg_quant
+                         : (!memcmp(mg,"TLQ1",4) || !memcmp(mg,"TLQ2",4) || getenv("TINYLM_Q8")!=NULL);
+    Weights w; map_weights(&c,P,&w);
+    if(is_gguf) w.ng=gg_ng;
+    Gen *gn=gen_new(&c,&w,use_q8);
     /* every heavy tensor now has an int8 copy -- drop the fp32 block */
     float *kept = gn->q8 ? gen_drop_fp32(&c,&w,&P) : NULL; (void)kept;
     int nthreads=g_pool_nt;
@@ -3677,12 +3859,16 @@ static int cmd_score(int argc, char **argv){
     const char *arg=argv[2];
     char path[1024]; model_path(arg, path, sizeof(path));
     FILE *e=fopen(path,"rb"); if(e) fclose(e); else snprintf(path,sizeof(path),"%s",arg);
-    Cfg c; Tok *tk=NULL; float *P=model_load_full(path,&c,&tk);
+    char mg[4]={0}; { FILE *qf=fopen(path,"rb"); if(qf){ if(fread(mg,1,4,qf)!=4) mg[0]=0; fclose(qf); } }
+    int is_gguf=!memcmp(mg,"GGUF",4);
+    Cfg c; Tok *tk=NULL; Ng gg_ng; memset(&gg_ng,0,sizeof(gg_ng)); int gg_quant=0;
+    float *P = is_gguf ? gguf_load_full(path,&c,&tk,&gg_ng,&gg_quant) : model_load_full(path,&c,&tk);
+    if(is_gguf && !P){ fprintf(stderr,"failed to load GGUF %s\n",path); return 1; }
     if(!tk){ fprintf(stderr,"'%s' has no bundled tokenizer\n",path); return 1; }
-    int use_q8=getenv("TINYLM_Q8")!=NULL;
-    { FILE *qf=fopen(path,"rb"); if(qf){ char mg[4]={0}; if(fread(mg,1,4,qf)==4 &&
-        (!memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4))) use_q8=1; fclose(qf); } }
-    Weights w; map_weights(&c,P,&w); memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng);
+    int use_q8 = is_gguf ? gg_quant : (getenv("TINYLM_Q8")!=NULL
+        || !memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4));
+    Weights w; map_weights(&c,P,&w);
+    if(is_gguf){ w.ng=gg_ng; } else { memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng); }
     Gen *gn=gen_new(&c,&w,use_q8);
     /* every heavy tensor now has an int8 copy -- drop the fp32 block */
     float *kept = gn->q8 ? gen_drop_fp32(&c,&w,&P) : NULL; (void)kept;
@@ -3750,12 +3936,20 @@ static int cmd_run(int argc, char **argv){
     FILE *e=fopen(path,"rb"); if(e) fclose(e); else snprintf(path,sizeof(path),"%s",arg);
     char mg[4]={0}; { FILE *qf=fopen(path,"rb"); if(qf){ if(fread(mg,1,4,qf)!=4) mg[0]=0; fclose(qf); } }
     int is_tlq3 = !memcmp(mg,"TLQ3",4);
+    int is_gguf = !memcmp(mg,"GGUF",4);
     /* Phase 2B: TINYLM_Q4 makes the low-peak loader build true 4-bit QMats
      * (half the weight RAM) instead of int8. int8 remains the default. Only the
      * low-peak TLQ3 path honours it. */
     g_q4 = is_tlq3 && !getenv("TINYLM_HIGHPEAK") && getenv("TINYLM_Q4")!=NULL;
     Cfg c; Tok *tk=NULL; Weights w; Gen *gn; float *P=NULL, *kept=NULL;
-    if(is_tlq3 && !getenv("TINYLM_HIGHPEAK")){
+    if(is_gguf){
+        Ng gg_ng; memset(&gg_ng,0,sizeof(gg_ng)); int gg_quant=0;
+        P=gguf_load_full(path,&c,&tk,&gg_ng,&gg_quant);
+        if(!P){ fprintf(stderr,"failed to load GGUF %s\n",path); return 1; }
+        map_weights(&c,P,&w); w.ng=gg_ng;
+        gn=gen_new(&c,&w,gg_quant);
+        kept = gn->q8 ? gen_drop_fp32(&c,&w,&P) : NULL;
+    } else if(is_tlq3 && !getenv("TINYLM_HIGHPEAK")){
         /* low-peak: decode tensor-by-tensor straight into QMats (Phase 2A/2B) */
         gn=load_q4_lowpeak(path,&c,&w,&tk,&kept);
         memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng);
@@ -3843,12 +4037,16 @@ static int cmd_chat(int argc, char **argv){
         "  Defaults: max_tokens=256 temp=0.8 topk=40 (use temp 0 for greedy)\n"); return 1; }
     char path[1024]; model_path(argv[2], path, sizeof(path));
     { FILE *e=fopen(path,"rb"); if(e) fclose(e); else snprintf(path,sizeof(path),"%s",argv[2]); }
-    Cfg c; Tok *tk=NULL; float *P=model_load_full(path,&c,&tk);
+    char mg[4]={0}; { FILE *qf=fopen(path,"rb"); if(qf){ if(fread(mg,1,4,qf)!=4) mg[0]=0; fclose(qf); } }
+    int is_gguf=!memcmp(mg,"GGUF",4);
+    Cfg c; Tok *tk=NULL; Ng gg_ng; memset(&gg_ng,0,sizeof(gg_ng)); int gg_quant=0;
+    float *P = is_gguf ? gguf_load_full(path,&c,&tk,&gg_ng,&gg_quant) : model_load_full(path,&c,&tk);
+    if(is_gguf && !P){ fprintf(stderr,"failed to load GGUF %s\n",path); return 1; }
     if(!tk){ fprintf(stderr,"'%s' has no bundled tokenizer.\n",path); return 1; }
-    int use_q8=getenv("TINYLM_Q8")!=NULL;
-    { FILE *qf=fopen(path,"rb"); if(qf){ char mg[4]={0}; if(fread(mg,1,4,qf)==4 &&
-        (!memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4))) use_q8=1; fclose(qf); } }
-    Weights w; map_weights(&c,P,&w); memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng);
+    int use_q8 = is_gguf ? gg_quant : (getenv("TINYLM_Q8")!=NULL
+        || !memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4));
+    Weights w; map_weights(&c,P,&w);
+    if(is_gguf){ w.ng=gg_ng; } else { memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng); }
     Gen *gn=gen_new(&c,&w,use_q8);
     /* every heavy tensor now has an int8 copy -- drop the fp32 block */
     float *kept = gn->q8 ? gen_drop_fp32(&c,&w,&P) : NULL; (void)kept;
