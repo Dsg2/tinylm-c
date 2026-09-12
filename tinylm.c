@@ -51,6 +51,10 @@ typedef struct {
      * Both consume no space when zero, so every TLM1-5 checkpoint keeps the
      * exact layout it has always had. */
     int n_shared, qknorm;
+    /* TLM7/TLQ4: MoE routing K baked into the checkpoint so a served model
+     * routes with the K it was trained on without CUDALM_TOPK being set.
+     * 0 = not recorded (older files) -> falls back to env, then 1. */
+    int topk;
     float rope_base;
 } Cfg;
 /* total expert slots in a layer: routed + shared (1 == the dense FFN) */
@@ -786,8 +790,17 @@ static inline float siluf(float z){ return z/(1.0f+expf(-z)); }
  * told the same value the model was trained with. Default 1; the served TLM4
  * checkpoint was trained CUDALM_TOPK=2, so set that env to reproduce it. */
 static int g_moe_topk=0;   /* 0 = unresolved */
+static int g_cfg_topk=0;   /* K baked into the loaded checkpoint (0 = none) */
+/* Every loader calls this once the header/KVs are parsed, so a served model
+ * routes with its trained K automatically. Resets the resolved cache so a
+ * second model loaded in the same process re-resolves. */
+static void note_cfg_topk(int k){ g_cfg_topk = k>0?k:0; g_moe_topk=0; }
 static int moe_topk(int E){
-    if(!g_moe_topk){ const char *s=getenv("CUDALM_TOPK"); int k=s?atoi(s):1; g_moe_topk=k<1?1:k; }
+    if(!g_moe_topk){
+        const char *s=getenv("CUDALM_TOPK");           /* explicit override wins */
+        int k = s ? atoi(s) : (g_cfg_topk>0 ? g_cfg_topk : 1);
+        g_moe_topk = k<1 ? 1 : k;
+    }
     int k=g_moe_topk; return k>E?E:k;
 }
 /* Index of the k-th largest prob (k=0 = max), ties broken by lowest index --
@@ -1663,7 +1676,8 @@ static void tok_print(const Tok *tk, int id){
 
 /* ----------------------------- save/load model -------------------------- */
 /* header sizes by magic: TLM1=8 ints, TLM2=9 (+tmpl), TLM3=10 (+n_mtp) */
-static int hdr_ints(const char *m, int *v){  /* *v = version 1..6, returns #ints */
+static int hdr_ints(const char *m, int *v){  /* *v = version 1..7, returns #ints */
+    if(!memcmp(m,"TLM7",4)){ *v=7; return 16; }   /* adds topk */
     if(!memcmp(m,"TLM6",4)){ *v=6; return 15; }   /* adds n_shared, qknorm */
     if(!memcmp(m,"TLM5",4)){ *v=5; return 13; }   /* adds win, full_every */
     if(!memcmp(m,"TLM4",4)){ *v=4; return 11; }
@@ -1685,6 +1699,8 @@ static void cfg_from_hdr(Cfg *c, const int *hdr, int ver){
     c->full_every = ver>=5 ? hdr[12] : 0;
     c->n_shared   = ver>=6 ? hdr[13] : 0;
     c->qknorm     = ver>=6 ? hdr[14] : 0;
+    c->topk       = ver>=7 ? hdr[15] : 0;
+    note_cfg_topk(c->topk);
     c->rope_base=10000.0f; cfg_derive(c);
 }
 /* ---- fp16 <-> fp32 (portable software; weights are small normals) ---------- */
@@ -1865,11 +1881,11 @@ static float *model_load(const char *path, Cfg *c){
     size_t len; uint8_t *buf=read_file(path,&len);
     if(!buf){fprintf(stderr,"cannot open %s\n",path);exit(1);}
     Rd r={buf,buf+len}; char m[4]; rd(&r,m,4);
-    /* TLQ1 mirrors TLM4 (11 ints), TLQ2 mirrors TLM5 (13, carries win). */
+    /* TLQ1 mirrors TLM4 (11), TLQ2 TLM5 (13, win), TLQ3 TLM6 (15), TLQ4 TLM7 (16, topk). */
     int qz = !memcmp(m,"TLQ1",4) ? 1 : (!memcmp(m,"TLQ2",4) ? 2 :
-             (!memcmp(m,"TLQ3",4) ? 3 : 0));
+             (!memcmp(m,"TLQ3",4) ? 3 : (!memcmp(m,"TLQ4",4) ? 4 : 0)));
     if(qz){
-        int nh = qz==1 ? 11 : (qz==2 ? 13 : 15), qver = qz==1 ? 4 : (qz==2 ? 5 : 6);
+        int nh = qz==1?11:qz==2?13:qz==3?15:16, qver = qz==1?4:qz==2?5:qz==3?6:7;
         int hdr[HDR_MAX]; rd(&r,hdr,4*nh); cfg_from_hdr(c,hdr,qver);
         int qtype=0,group=64; rd(&r,&qtype,4); rd(&r,&group,4);
         size_t n=param_count(c); float *P=fz(n);
@@ -1908,9 +1924,9 @@ static float *model_load_full(const char *path, Cfg *c, Tok **tk_out){
     Rd r={buf,buf+len}; char m[4]; rd(&r,m,4);
     *tk_out=NULL;
     int qz = !memcmp(m,"TLQ1",4) ? 1 : (!memcmp(m,"TLQ2",4) ? 2 :
-             (!memcmp(m,"TLQ3",4) ? 3 : 0));
+             (!memcmp(m,"TLQ3",4) ? 3 : (!memcmp(m,"TLQ4",4) ? 4 : 0)));
     if(qz){                                                    /* quantized checkpoint */
-        int nh = qz==1 ? 11 : (qz==2 ? 13 : 15), qver = qz==1 ? 4 : (qz==2 ? 5 : 6);
+        int nh = qz==1?11:qz==2?13:qz==3?15:16, qver = qz==1?4:qz==2?5:qz==3?6:7;
         int hdr[HDR_MAX]; rd(&r,hdr,4*nh); cfg_from_hdr(c,hdr,qver);
         int qtype=0,group=64; rd(&r,&qtype,4); rd(&r,&group,4);
         size_t n=param_count(c); float *P=fz(n);
@@ -2160,7 +2176,7 @@ static float *gguf_load_full(const char *path, Cfg *c, Tok **tk_out, Ng *ng_out,
     if(tk_out) *tk_out=NULL;
     if(ng_out) memset(ng_out,0,sizeof(*ng_out));
     if(quant_out) *quant_out=0;
-    int qtype=-1, group=0;
+    int qtype=-1, group=0, topk_kv=0;
     size_t len; uint8_t *buf=read_file(path,&len);
     if(!buf){ fprintf(stderr,"cannot open %s\n",path); return NULL; }
     const uint8_t *end=buf+len, *p=buf;
@@ -2189,6 +2205,8 @@ static float *gguf_load_full(const char *path, Cfg *c, Tok **tk_out, Ng *ng_out,
             if(v+4<=end) qtype=(int)gg_u32(v);
         } else if(kl==12 && !memcmp(key,"tinylm.group",12) && vtype==4){
             if(v+4<=end) group=(int)gg_u32(v);
+        } else if(kl==11 && !memcmp(key,"tinylm.topk",11) && vtype==4){
+            if(v+4<=end) topk_kv=(int)gg_u32(v);
         } else if(kl==16 && !memcmp(key,"tinylm.has_ngram",16) && vtype==7){
             has_ng = v<end ? v[0]!=0 : 0;
         } else if(kl==12 && !memcmp(key,"tinylm.ngram",12) && vtype==9){
@@ -2218,6 +2236,7 @@ static float *gguf_load_full(const char *path, Cfg *c, Tok **tk_out, Ng *ng_out,
 
     /* config */
     cfg_from_hdr(c,hdr,6);
+    if(topk_kv>0){ c->topk=topk_kv; note_cfg_topk(topk_kv); }   /* self-describe MoE K */
 
     /* params: a quantized checkpoint carries the raw quant body in
      * tinylm.qparams (I8); dequantize it exactly as model_load_full() does so
@@ -3290,8 +3309,10 @@ static Gen *load_q4_lowpeak(const char *path, Cfg *c, Weights *w, Tok **tk_out, 
     size_t rcap=1<<18; uint8_t *rbuf=malloc(rcap);       /* refill window, not the whole file */
     if(!rbuf){fprintf(stderr,"OOM rbuf\n");exit(1);}
     Rd r={rbuf,rbuf,fp,rbuf,rcap}; char m[4]; rd(&r,m,4);
-    if(memcmp(m,"TLQ3",4)){fprintf(stderr,"load_q4_lowpeak: not TLQ3\n");exit(1);}
-    int hdr[HDR_MAX]; rd(&r,hdr,4*15); cfg_from_hdr(c,hdr,6);
+    int q4v = !memcmp(m,"TLQ3",4)?3 : (!memcmp(m,"TLQ4",4)?4:0);
+    if(!q4v){fprintf(stderr,"load_q4_lowpeak: not TLQ3/TLQ4\n");exit(1);}
+    int q4nh=q4v==3?15:16, q4ver=q4v==3?6:7;
+    int hdr[HDR_MAX]; rd(&r,hdr,4*q4nh); cfg_from_hdr(c,hdr,q4ver);
     int qtype=0,group=128; rd(&r,&qtype,4); rd(&r,&group,4);
     check_supported(c,path);
     *tk_out=NULL;
@@ -3866,7 +3887,7 @@ static int cmd_score(int argc, char **argv){
     if(is_gguf && !P){ fprintf(stderr,"failed to load GGUF %s\n",path); return 1; }
     if(!tk){ fprintf(stderr,"'%s' has no bundled tokenizer\n",path); return 1; }
     int use_q8 = is_gguf ? gg_quant : (getenv("TINYLM_Q8")!=NULL
-        || !memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4));
+        || !memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4)||!memcmp(mg,"TLQ4",4));
     Weights w; map_weights(&c,P,&w);
     if(is_gguf){ w.ng=gg_ng; } else { memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng); }
     Gen *gn=gen_new(&c,&w,use_q8);
@@ -3935,7 +3956,7 @@ static int cmd_run(int argc, char **argv){
     char path[1024]; model_path(arg, path, sizeof(path));
     FILE *e=fopen(path,"rb"); if(e) fclose(e); else snprintf(path,sizeof(path),"%s",arg);
     char mg[4]={0}; { FILE *qf=fopen(path,"rb"); if(qf){ if(fread(mg,1,4,qf)!=4) mg[0]=0; fclose(qf); } }
-    int is_tlq3 = !memcmp(mg,"TLQ3",4);
+    int is_tlq3 = !memcmp(mg,"TLQ3",4) || !memcmp(mg,"TLQ4",4);   /* TLQ4 = TLQ3 + topk */
     int is_gguf = !memcmp(mg,"GGUF",4);
     /* Phase 2B: TINYLM_Q4 makes the low-peak loader build true 4-bit QMats
      * (half the weight RAM) instead of int8. int8 remains the default. Only the
@@ -3956,7 +3977,7 @@ static int cmd_run(int argc, char **argv){
     } else {
         P=model_load_full(path,&c,&tk);
         int use_q8=getenv("TINYLM_Q8")!=NULL;
-        if(!memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4)) use_q8=1;
+        if(!memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4)||!memcmp(mg,"TLQ4",4)) use_q8=1;
         map_weights(&c,P,&w); memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng);
         gn=gen_new(&c,&w,use_q8);
         /* every heavy tensor now has an int8 copy -- drop the fp32 block */
@@ -4044,7 +4065,7 @@ static int cmd_chat(int argc, char **argv){
     if(is_gguf && !P){ fprintf(stderr,"failed to load GGUF %s\n",path); return 1; }
     if(!tk){ fprintf(stderr,"'%s' has no bundled tokenizer.\n",path); return 1; }
     int use_q8 = is_gguf ? gg_quant : (getenv("TINYLM_Q8")!=NULL
-        || !memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4));
+        || !memcmp(mg,"TLQ1",4)||!memcmp(mg,"TLQ2",4)||!memcmp(mg,"TLQ3",4)||!memcmp(mg,"TLQ4",4));
     Weights w; map_weights(&c,P,&w);
     if(is_gguf){ w.ng=gg_ng; } else { memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng); }
     Gen *gn=gen_new(&c,&w,use_q8);
@@ -4158,7 +4179,7 @@ static int cmd_quantize(int argc, char **argv){
     size_t flen; uint8_t *buf=read_file(in,&flen);
     if(!buf){ fprintf(stderr,"cannot open %s\n",in); return 1; }
     Rd r={buf,buf+flen}; char m[4]; rd(&r,m,4);
-    if(!memcmp(m,"TLQ1",4)||!memcmp(m,"TLQ2",4)||!memcmp(m,"TLQ3",4)){ fprintf(stderr,"%s is already quantized\n",in); free(buf); return 1; }
+    if(!memcmp(m,"TLQ1",4)||!memcmp(m,"TLQ2",4)||!memcmp(m,"TLQ3",4)||!memcmp(m,"TLQ4",4)){ fprintf(stderr,"%s is already quantized\n",in); free(buf); return 1; }
     int ver, nh=hdr_ints(m,&ver);
     if(!nh){ fprintf(stderr,"%s: not a tinylm model\n",in); free(buf); return 1; }
     int hdr[HDR_MAX]; if(!rd(&r,hdr,4*nh)){ fprintf(stderr,"bad header\n"); free(buf); return 1; }
@@ -4185,7 +4206,16 @@ static int cmd_quantize(int argc, char **argv){
     /* Selective q4 (wtype==3) is stamped TLQ3 (qver6, 15 ints) so the magic
      * matches the content -- the low-peak/int4 run paths gate on the magic.
      * Otherwise the TLM4/TLM5 split: TLQ2 when there is a window, else TLQ1. */
-    if(wtype==3){
+    /* Bake the MoE routing K in when known (env override, else carried from a
+     * TLM7 input) so the quantized model self-describes its routing. TLQ4 is a
+     * strict superset of TLQ3, valid for any wtype. */
+    int otopk=0; { const char *s=getenv("CUDALM_TOPK");
+        if(s){ int k=atoi(s); if(k>0) otopk=k; } else if(c.topk>0) otopk=c.topk; }
+    if(otopk>0){
+        int oh[16]={c.V,c.D,c.L,c.H,c.KV,c.F,c.T,c.eot,c.tmpl,c.n_mtp,c.n_exp,
+                    c.win,c.full_every,c.n_shared,c.qknorm,otopk};
+        fwrite("TLQ4",1,4,f); fwrite(oh,4,16,f);
+    } else if(wtype==3){
         int oh[15]={c.V,c.D,c.L,c.H,c.KV,c.F,c.T,c.eot,c.tmpl,c.n_mtp,c.n_exp,
                     c.win,c.full_every,c.n_shared,c.qknorm};
         fwrite("TLQ3",1,4,f); fwrite(oh,4,15,f);
@@ -4201,7 +4231,7 @@ static int cmd_quantize(int argc, char **argv){
     fwrite(&tl,4,1,f); if(tl>0&&blob) fwrite(blob,1,tl,f);
     fclose(f);
 
-    int hbytes=(wtype==3?15:c.win>0?13:11)*4;
+    int hbytes=(otopk>0?16:wtype==3?15:c.win>0?13:11)*4;
     double insz=(double)flen, outsz=4+hbytes+8+(double)qlen+4+tl;
     printf("[quantize] %s -> %s  (%s, %zu params)\n", in, out, qtype==2?"q4":qtype==1?"q8":"fp16", n);
     printf("[quantize] %.2f MB -> %.2f MB  (%.2fx smaller) | max|err| %.2e, mean-rel %.2e | tok %s\n",
