@@ -1986,7 +1986,7 @@ static void ng_q4_render_row(const Ng *ng, int De, unsigned int key, float *row,
 
 /* N-gram forward: hash bigram (tok[t-1], tok[t]) -> gather -> project Wng -> add to activation */
 static void ngram_forward(const Cfg *c, const Ng *ng, const int *tokens, int m, int start_pos,
-                          float *x){
+                          int prev, float *x){
     if(!ng->Wng) return;  /* n-gram not loaded */
     int V=c->V, D=c->D, De=ng->De, R=ng->R;
     float *buf=(float*)malloc(De*sizeof(float));
@@ -1995,8 +1995,7 @@ static void ngram_forward(const Cfg *c, const Ng *ng, const int *tokens, int m, 
         /* get prior token (at position start_pos+j-1 in the full sequence) */
         int t_prev=-1;
         if(start_pos+j>0){
-            if(j>0) t_prev=tokens[j-1];
-            /* else: prior token is outside this chunk, would need external state */
+            t_prev = j>0 ? tokens[j-1] : prev;   /* prev = last token of the previous chunk */
         }
         int t_cur=tokens[j]; if(t_cur<0||t_cur>=V) t_cur=-1;
         unsigned int key=(t_cur>=0) ? ng_hash(t_prev,t_cur,R) : (unsigned int)-1;
@@ -2831,6 +2830,7 @@ typedef struct {
     float *fn,*logits,*rinv,*probs;
     float *hlog,*hh,*ht;              /* single-row scratch (main/MTP heads) */
     int   *posbuf;
+    int    ng_prev;                   /* last committed token, feeds the n-gram hash across chunks */
     int   *moe_as; float *moe_gt,*moe_rp;    /* MoE routing scratch, allocated once:
                                                 forward_chunk used to malloc/free
                                                 three of these per layer per token */
@@ -3502,7 +3502,8 @@ static void forward_chunk(const Cfg *c, const Weights *w, Gen *gn,
     float scale=1.0f/sqrtf((float)hd); int grp=H/KV;
     for(int j=0;j<m;j++){ memcpy(gn->x+(size_t)j*D, w->emb+(size_t)tokens[j]*D, sizeof(float)*D);
                           gn->posbuf[j]=start_pos+j; }
-    if(w->ng.R>0) ngram_forward(c, &w->ng, tokens, m, start_pos, gn->x);
+    if(w->ng.R>0) ngram_forward(c, &w->ng, tokens, m, start_pos, start_pos>0?gn->ng_prev:-1, gn->x);
+    gn->ng_prev=tokens[m-1];
     for(int l=0;l<c->L;l++){
         rmsnorm_fwd(gn->x, w->an1[l], gn->xn, gn->rinv, m, D);
         /* One fused Q|K|V GEMV, then split the rows back out. The split copies
@@ -3745,7 +3746,7 @@ static void run_generation(const Cfg *c, const Weights *w, Gen *gn, const Tok *t
                                      else { tok_print(tk,m_r); generated++; n_acc++; } }
                 else break;
             }
-            acc_sum+=n_acc; pos+=n_acc+1; fn_cur=gn->fn+(size_t)n_acc*c->D;
+            acc_sum+=n_acc; pos+=n_acc+1; gn->ng_prev=draft[n_acc]; fn_cur=gn->fn+(size_t)n_acc*c->D;
             lg_cur=gn->logits+(size_t)n_acc*c->V; fflush(stdout);
         }
         free(draft);
@@ -4515,6 +4516,9 @@ static void set_ftz(void){
 #endif
 }
 int main(int argc, char **argv){
+#ifdef _WIN32
+    { extern __declspec(dllimport) int __stdcall SetConsoleOutputCP(unsigned); SetConsoleOutputCP(65001); }
+#endif
     { const char *sd=getenv("TINYLM_SEED");   /* pin the batch order so two runs
            see identical data -- required for any A/B to mean anything */
       if(sd) g_rng = (uint64_t)strtoull(sd,NULL,10) | 1ULL;
