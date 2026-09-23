@@ -11,6 +11,8 @@ the hot loops (GEMMs, attention, norms, optimizer) are parallelized with
 - `tools/export_tokenizer.py` — one-time helper: dumps the HF `tokenizer.json` into a flat
   `tokenizer.bin` (decode table + byte map + merge ranks) the C code reads.
 
+*Prebuilts available in github Actions tab*
+
 ## Build (MSYS2 MinGW64)
 ```
 # fast (recommended for m16+): OpenBLAS-backed GEMM, ~2x on the big presets
