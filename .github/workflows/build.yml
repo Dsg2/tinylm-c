@@ -1,0 +1,44 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install MinGW-w64
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-mingw-w64-x86-64
+
+    - name: Build tinylm.exe
+      run: |
+        x86_64-w64-mingw32-gcc \
+          -O3 \
+          -mavx2 \
+          -ffast-math \
+          -funroll-loops \
+          -fopenmp \
+          -flto \
+          -o tinylm.exe \
+          tinylm.c \
+          -lm
+
+    - name: Verify executable
+      run: |
+        file tinylm.exe
+        x86_64-w64-mingw32-objdump -f tinylm.exe
+
+    - name: Upload tinylm.exe
+      uses: actions/upload-artifact@v4
+      with:
+        name: tinylm-windows-x86-64
+        path: tinylm.exe
