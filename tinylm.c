@@ -328,6 +328,7 @@ typedef struct {
     float sref;                      /* reference scale */
     FILE *fs;                        /* open handle to .opt.ng when streaming digits from disk */
     long long doff;                  /* byte offset of the digit block within the file */
+    struct Eg *eg;                   /* NGR2 sparse engram (replaces the bigram head when set) */
 } Ng;
 
 typedef struct {
@@ -797,25 +798,36 @@ static int g_cfg_topk=0;   /* K baked into the loaded checkpoint (0 = none) */
 static void note_cfg_topk(int k){ g_cfg_topk = k>0?k:0; g_moe_topk=0; }
 static int moe_topk(int E){
     if(!g_moe_topk){
-        const char *s=getenv("CUDALM_TOPK");           /* explicit override wins */
-        int k = s ? atoi(s) : (g_cfg_topk>0 ? g_cfg_topk : 1);
+        const char *s=getenv("CUDALM_TOPK");           /* explicit positive override wins */
+        int e = s ? atoi(s) : 0;
+        int k = e>0 ? e : (g_cfg_topk>0 ? g_cfg_topk : 1);
         g_moe_topk = k<1 ? 1 : k;
     }
     int k=g_moe_topk; return k>E?E:k;
 }
-/* Index of the k-th largest prob (k=0 = max), ties broken by lowest index --
- * matches cudalm's strict-greater argmax-with-masking in k_router_topk. */
-static inline int moe_kth(const float *pr, int E, int k){
-    for(int e=0;e<E;e++){
-        float v=pr[e]; int rank=0;
-        for(int e2=0;e2<E;e2++) if(pr[e2]>v || (pr[e2]==v && e2<e)) rank++;
-        if(rank==k) return e;
+/* cudalm router bias (<model>.opt.t1 or GGUF tinylm.router_bias), layout [L][S][E]
+ * with S = K (per-slot) or 1 (shared). Selection-only: gates stay raw probs. */
+static float *g_rbias=NULL; static int g_rbias_S=0;
+static void rbias_set(float *b, int S){ free(g_rbias); g_rbias=b; g_rbias_S=S; }
+/* Slots 0..K-1: strict-greater argmax of pr[e]+bias[slot][e] over unchosen e
+ * (ties -> lowest index) -- exactly cudalm's k_router_topk. */
+static inline void moe_route(const float *pr, int E, int l, int K, int *sel){
+    const float *b = g_rbias ? g_rbias+(size_t)l*g_rbias_S*E : NULL;
+    for(int k=0;k<K;k++){
+        const float *bk = b ? b+(size_t)(k<g_rbias_S?k:g_rbias_S-1)*E : NULL;
+        int best=-1; float bp=-1e30f;
+        for(int e=0;e<E;e++){
+            int t=0; for(int j=0;j<k;j++) if(sel[j]==e){ t=1; break; }
+            if(t) continue;
+            float sc=pr[e]+(bk?bk[e]:0.f);
+            if(sc>bp){ bp=sc; best=e; }
+        }
+        sel[k]=best<0?k:best;
     }
-    return 0;
 }
 /* Shared scratch for the gather/scatter expert GEMMs (grows as needed). */
 static float *me_X,*me_g,*me_u,*me_a,*me_y,*me_dy,*me_da,*me_dg,*me_du,*me_dX,*me_rt,*me_drt;
-static int *me_idx; static size_t me_cap=0;
+static int *me_idx,*me_sel; static size_t me_cap=0;
 /* int8 activation scratch for the fused single-token expert path */
 static int8_t *me_xq=NULL,*me_aq=NULL; static float *me_xs=NULL,*me_as=NULL; static int me_qcap=0;
 static void me_qensure(int D,int F){
@@ -832,7 +844,7 @@ static void me_ensure(int N,int D,int F,int E){
     me_y=realloc(me_y,nd*4); me_dy=realloc(me_dy,nd*4); me_da=realloc(me_da,nf*4);
     me_dg=realloc(me_dg,nf*4); me_du=realloc(me_du,nf*4); me_dX=realloc(me_dX,nd*4);
     me_rt=realloc(me_rt,ne*4); me_drt=realloc(me_drt,ne*4); me_idx=realloc(me_idx,(size_t)N*4);
-    me_cap=N;
+    me_sel=realloc(me_sel,ne*4); me_cap=N;
 }
 #define MOE_AUX 0.01f   /* load-balance aux-loss weight */
 
@@ -853,11 +865,12 @@ static void moe_forward(const Cfg *c, const Weights *w, int l, const float *fnor
         float mx=-1e30f; for(int e=0;e<E;e++) if(r[e]>mx)mx=r[e];
         float s=0; for(int e=0;e<E;e++){ pr[e]=expf(r[e]-mx); s+=pr[e]; }
         float inv=1.0f/s; for(int e=0;e<E;e++) pr[e]*=inv;
+        moe_route(pr,E,l,K,me_sel+(size_t)n*K);
     }
     memcpy(out, fin, sizeof(float)*(size_t)N*D);          /* residual */
     for(int k=0;k<K;k++){
         #pragma omp parallel for schedule(static)
-        for(int n=0;n<N;n++){ int sel=moe_kth(rprobs+(size_t)n*E,E,k);
+        for(int n=0;n<N;n++){ int sel=me_sel[(size_t)n*K+k];
             assign[n]=sel; gate[n]=rprobs[(size_t)n*E+sel]; }
         for(int e=0;e<E;e++){
             int ne=0; for(int n=0;n<N;n++) if(assign[n]==e) me_idx[ne++]=n;   /* serial index build (cheap) */
@@ -1796,6 +1809,22 @@ static int q4_selective_decode(Rd *r, float *P, size_t n, const Cfg *c, int grou
     for(size_t k=cur;k<n;k++){ uint16_t h; if(!rd(r,&h,2))return 0; P[k]=f16_to_f32(h); }
     return 1;
 }
+/* cudalm q4n (qtype 3 inside TLQ1/TLQ2; tinylm's own qtype 3 is only ever TLQ3/TLQ4):
+   per group fp32 scale + packed signed nibbles; a NaN scale means g raw fp32 follow. Lossless. */
+static int q4n_decode(Rd *r, float *P, size_t n, int group){
+    for(size_t i=0;i<n;i+=group){
+        int g=(i+(size_t)group<=n)?group:(int)(n-i); float s; uint32_t sb;
+        if(!rd(r,&s,4)) return 0;
+        memcpy(&sb,&s,4);                      /* bit test: -ffast-math folds s!=s to 0 */
+        if((sb&0x7f800000u)==0x7f800000u && (sb&0x7fffffu)){ if(!rd(r,P+i,4*(size_t)g)) return 0; continue; }
+        for(int j=0;j<g;j+=2){
+            uint8_t b; if(!rd(r,&b,1)) return 0;
+            int lo=b&0xF; if(lo>=8)lo-=16; P[i+j]=(float)lo*s;
+            if(j+1<g){ int hi=(b>>4)&0xF; if(hi>=8)hi-=16; P[i+j+1]=(float)hi*s; }
+        }
+    }
+    return 1;
+}
 /* Quantize P[n] -> malloc'd byte buffer (*out_len). qtype 0=fp16 (2B/w),
    1=q8 (Q8_0-style block: fp16 scale + int8 per `group` weights). */
 static uint8_t *quantize_params(const float *P, size_t n, int qtype, int group, size_t *out_len){
@@ -1855,6 +1884,13 @@ static int dequantize_params(Rd *r, float *P, size_t n, int qtype, int group){
     }
     return 1;
 }
+/* qtype 4 = cudalm q4n everywhere (GGUF code); qtype 3 = q4n in TLQ1/TLQ2, selective q4 in TLQ3/TLQ4/GGUF (qz=3) */
+static int dequant_any(Rd *r, float *P, size_t n, const Cfg *c, int qz, int qtype, int group){
+    if(qtype==4 || (qtype==3 && qz<=2)) return q4n_decode(r,P,n,group);
+    if(qtype==3) return q4_selective_decode(r,P,n,c,group);
+    if(qtype<0 || qtype>2){ fprintf(stderr,"unknown quant type %d\n",qtype); return 0; }
+    return dequantize_params(r,P,n,qtype,group);
+}
 
 /* Self-contained bundle (TLM4): header(11) + params + embedded tokenizer blob. */
 static void model_save_bundle(const char *path, const Cfg *c, const float *P, size_t n,
@@ -1889,8 +1925,7 @@ static float *model_load(const char *path, Cfg *c){
         int hdr[HDR_MAX]; rd(&r,hdr,4*nh); cfg_from_hdr(c,hdr,qver);
         int qtype=0,group=64; rd(&r,&qtype,4); rd(&r,&group,4);
         size_t n=param_count(c); float *P=fz(n);
-        int ok = qtype==3 ? q4_selective_decode(&r,P,n,c,group)
-                          : dequantize_params(&r,P,n,qtype,group);
+        int ok = dequant_any(&r,P,n,c,qz,qtype,group);
         if(!ok){fprintf(stderr,"quant body\n");exit(1);}
         free(buf); return P;
     }
@@ -1930,8 +1965,7 @@ static float *model_load_full(const char *path, Cfg *c, Tok **tk_out){
         int hdr[HDR_MAX]; rd(&r,hdr,4*nh); cfg_from_hdr(c,hdr,qver);
         int qtype=0,group=64; rd(&r,&qtype,4); rd(&r,&group,4);
         size_t n=param_count(c); float *P=fz(n);
-        int ok = qtype==3 ? q4_selective_decode(&r,P,n,c,group)
-                          : dequantize_params(&r,P,n,qtype,group);
+        int ok = dequant_any(&r,P,n,c,qz,qtype,group);
         if(!ok){fprintf(stderr,"quant body\n");exit(1);}
         check_supported(c,path);
         int tl=0; if(rd(&r,&tl,4) && tl>0){ *tk_out=tok_parse(r.p,tl,1); }
@@ -1973,7 +2007,7 @@ static void ng_render_bytes(const signed char *rowb, float sg, int De, float *ro
    scratch (>= De/2 bytes) backs the disk read. */
 static void ng_q4_render_row(const Ng *ng, int De, unsigned int key, float *row, signed char *scratch){
     if(key==(unsigned int)-1){ memset(row,0,De*sizeof(float)); return; }
-    int gi=key/ng->group; if(gi>=ng->ngrp) gi=ng->ngrp-1;
+    int gi=(int)((unsigned long long)key*De/ng->group); if(gi>=ng->ngrp) gi=ng->ngrp-1;
     float sg=ng->s[gi];
     if(ng->d){ ng_render_bytes(ng->d + (unsigned long long)key*(De/2), sg, De, row); return; }
     /* streaming: rows are De nibbles = De/2 bytes, byte-aligned since De is even */
@@ -2009,6 +2043,132 @@ static void ngram_forward(const Cfg *c, const Ng *ng, const int *tokens, int m, 
         }
     }
     free(buf); free(scratch);
+}
+
+/* ---- sparse engram (cudalm17 NGR2) --------------------------------------
+ * S = heads x orders hashed sub-tables; per position the S rows (De each) are
+ * concatenated, projected by a per-point Wv, optionally gated (sigmoid of the
+ * signed-sqrt RMS dot with k=buf@Wk) and passed through a causal depthwise
+ * conv (k=4, dilation = max order, SiLU), then added to the residual stream at
+ * the input of each listed layer. Mirrors cudalm17 engram_forward exactly.
+ * hdr: 0 H,1 n_orders,2-5 ord,6 De,7 R,8 q4,9 fold,10 np,11-18 layers,19 conv,
+ *      20 canon,21 gate,22 D,23 iter */
+#define EG_MAXS 32
+#define EG_MAXP 8
+typedef struct Eg {
+    int h[24], V, S, De, Rp, np, dil, ord[EG_MAXS], prime[EG_MAXS];
+    unsigned long long mult[EG_MAXS*4];
+    unsigned short *cn;                                   /* canonical token map (E5) */
+    float *W, *Wv[EG_MAXP], *Wk[EG_MAXP], *nw[EG_MAXP], *K[EG_MAXP];
+    signed char *d; float *s, *tbl;                       /* q4 digits+scales, or fp32 table */
+    size_t nt, nwp, ngrp;
+} Eg;
+typedef struct EgGen { int pstart, pm, ht[3], *ptok; float *buf, *v, *k, *ri, *y[EG_MAXP], *hy[EG_MAXP]; } EgGen;
+
+static unsigned long long eg_mix(unsigned long long x){
+    x+=0x9e3779b97f4a7c15ULL; x=(x^(x>>30))*0xbf58476d1ce4e5b9ULL; x=(x^(x>>27))*0x94d049bb133111ebULL; return x^(x>>31); }
+static int eg_isprime(int p){ if(p<2) return 0; for(int d=2;(long long)d*d<=p;d++) if(p%d==0) return 0; return 1; }
+/* validate an NGR2 header, derive the hash, allocate the point weights; 0 if unsupported */
+static int eg_init(Eg *e, const int *h, const Cfg *c){
+    memset(e,0,sizeof *e); memcpy(e->h,h,sizeof e->h);
+    int H=h[0], no=h[1], De=h[6], R=h[7], np=h[10];
+    e->V=c->V; e->S=H*no; e->De=De; e->np=np; e->dil=1;
+    int bad=H<1||no<1||no>4||e->S>EG_MAXS||De<1||De>1024||R<2||np<1||np>EG_MAXP||(unsigned)h[8]>1
+          ||(h[19]!=0&&h[19]!=4)||(unsigned)h[20]>1||(unsigned)h[21]>1||h[22]!=c->D;
+    for(int i=0;i<no&&!bad;i++){ int o=h[2+i]; if(o<1||o>4) bad=1; else if(o>e->dil) e->dil=o; }
+    for(int i=0;i<np&&!bad;i++) if(h[11+i]<0||h[11+i]>=c->L||(i&&h[11+i]<=h[10+i])) bad=1;
+    if(bad){ fprintf(stderr,"[eg] unsupported NGR2 header:");
+        for(int i=0;i<24;i++) fprintf(stderr," %d",h[i]);
+        fprintf(stderr," (model D=%d L=%d)\n",c->D,c->L); return 0; }
+    int al=128%De==0?128/De:1; e->Rp=(R+al-1)/al*al;
+    e->nt=(size_t)e->S*e->Rp*De; e->ngrp=(e->nt+127)/128; e->nwp=(size_t)e->S*De*c->D;
+    for(int s=0,p=R+1;s<e->S;s++){
+        do p--; while(p>1&&!eg_isprime(p));
+        if(p<2){ fprintf(stderr,"[eg] R=%d too small for %d sub-tables\n",R,e->S); return 0; }
+        e->prime[s]=p; e->ord[s]=h[2+s/H];
+        for(int k=0;k<4;k++) e->mult[s*4+k]=eg_mix(0x5EED0E17A11ULL+(unsigned long long)(s*4+k))|1ULL; }
+    size_t per=e->nwp*(h[21]?2:1)+(h[19]?5*(size_t)c->D:0);
+    float *W=e->W=fz(per*np);
+    for(int p=0;p<np;p++){ e->Wv[p]=W; W+=e->nwp;
+        if(h[21]){ e->Wk[p]=W; W+=e->nwp; }
+        if(h[19]){ e->nw[p]=W; W+=c->D; e->K[p]=W; W+=4*c->D; } }
+    return 1;
+}
+/* NGR2 body after magic+hdr, cudalm engram_save layout (optimizer moments skipped) */
+static int eg_read(Rd *r, Eg *e, int D){
+    int S=e->S, pr[EG_MAXS]; unsigned long long mu[EG_MAXS*4];
+    if(!rd(r,pr,4*(size_t)S)||!rd(r,mu,32*(size_t)S)) return 0;
+    if(memcmp(pr,e->prime,4*(size_t)S)||memcmp(mu,e->mult,32*(size_t)S)){
+        fprintf(stderr,"[eg] hash primes/multipliers differ from this build's NGR2 scheme\n"); return 0; }
+    if(e->h[20]){ e->cn=malloc((size_t)e->V*2); if(!rd(r,e->cn,(size_t)e->V*2)) return 0; }
+    size_t nw=e->nwp, nt=e->nt;
+    for(int p=0;p<e->np;p++){
+        if(!rd(r,e->Wv[p],nw*4)||!rd_skip(r,nw*4)) return 0;
+        if(e->h[21]&&(!rd(r,e->Wk[p],nw*4)||!rd_skip(r,nw*4))) return 0;
+        if(e->h[19]&&(!rd(r,e->nw[p],(size_t)D*4)||!rd_skip(r,(size_t)D*4)
+                      ||!rd(r,e->K[p],(size_t)D*16)||!rd_skip(r,(size_t)D*16))) return 0; }
+    if(!e->h[8]){ e->tbl=malloc(nt*4); return rd(r,e->tbl,nt*4)&&rd_skip(r,nt*4)&&r->p==r->end; }
+    e->d=malloc((nt+1)/2); e->s=malloc(e->ngrp*4);
+    return rd_skip(r,4)&&rd(r,e->d,(nt+1)/2)&&rd_skip(r,3*nt)&&rd(r,e->s,e->ngrp*4)&&rd_skip(r,e->ngrp*8)
+           &&r->p==r->end;
+}
+static EgGen *eg_gen(const Cfg *c, const Eg *e){
+    int CH=c->T, D=c->D; EgGen *g=calloc(1,sizeof *g);
+    g->ptok=malloc(sizeof(int)*CH); g->buf=fz((size_t)CH*e->S*e->De);
+    g->v=fz((size_t)CH*D); g->k=fz((size_t)CH*D); g->ri=fz(CH);
+    if(e->h[19]) for(int p=0;p<e->np;p++){ g->y[p]=fz((size_t)CH*D); g->hy[p]=fz((size_t)3*e->dil*D); }
+    return g;
+}
+/* Chunk start. First commit the accepted prefix of the previous chunk (start_pos-pstart
+ * rows, so rejected speculative drafts drop out) into the token / conv-input history,
+ * then gather the S concatenated rows for every position of this chunk. */
+static void eg_begin(const Cfg *c, const Eg *e, EgGen *g, const int *tok, int m, int start_pos){
+    int D=c->D, De=e->De, SD=e->S*De, a=start_pos-g->pstart;
+    if(start_pos>0 && g->pm && a>0){ if(a>g->pm) a=g->pm;
+        for(int k=2;k>=0;k--) g->ht[k]= k<a ? g->ptok[a-1-k] : g->ht[k-a];
+        if(e->h[19]) for(int p=0;p<e->np;p++) for(int k=3*e->dil-1;k>=0;k--)
+            memcpy(g->hy[p]+(size_t)k*D, k<a ? g->y[p]+(size_t)(a-1-k)*D : g->hy[p]+(size_t)(k-a)*D, sizeof(float)*D); }
+    g->pstart=start_pos; g->pm=m; memcpy(g->ptok,tok,sizeof(int)*m);
+    for(int j=0;j<m;j++){
+        int pos=start_pos+j, t[4];
+        for(int k=0;k<4;k++) t[k]= k<=j ? tok[j-k] : g->ht[k-j-1];
+        for(int s=0;s<e->S;s++){
+            float *o=g->buf+(size_t)j*SD+(size_t)s*De; int ord=e->ord[s];
+            if(pos<ord-1){ memset(o,0,sizeof(float)*De); continue; }
+            unsigned long long h=0;
+            for(int k=0;k<ord;k++){ unsigned v=(unsigned)t[k]; if(e->cn&&v<(unsigned)e->V) v=e->cn[v];
+                h^=(unsigned long long)v*e->mult[s*4+k]; }
+            size_t b=((size_t)(h%(unsigned long long)e->prime[s])+(size_t)s*e->Rp)*De;
+            if(e->tbl) memcpy(o,e->tbl+b,sizeof(float)*De);
+            else for(int i=0;i<De;i++) o[i]=e->s[(b+i)>>7]*(float)q4_unpack(e->d,b+i);
+        }
+    }
+}
+/* inject at the input of layer l (no-op unless l is an engram point) */
+static void eg_point(const Cfg *c, const Eg *e, EgGen *g, int l, int m, int start_pos, float *x){
+    int p=0; while(p<e->np&&e->h[11+p]!=l) p++;
+    if(p==e->np) return;
+    int D=c->D, SD=e->S*e->De; float *v=g->v;
+    mm(v,g->buf,e->Wv[p],m,SD,D);
+    if(e->h[21]){ mm(g->k,g->buf,e->Wk[p],m,SD,D);
+        for(int j=0;j<m;j++){
+            const float *h=x+(size_t)j*D, *k=g->k+(size_t)j*D; float a=0,b=0,z=0;
+            for(int i=0;i<D;i++){ a+=h[i]*h[i]; b+=k[i]*k[i]; z+=h[i]*k[i]; }
+            z*=(1.0f/sqrtf(a/D+1e-6f))*(1.0f/sqrtf(b/D+1e-6f))/sqrtf((float)D);
+            float gg=1.0f/(1.0f+expf(-copysignf(sqrtf(fmaxf(fabsf(z),1e-6f)),z)));
+            for(int i=0;i<D;i++) v[(size_t)j*D+i]*=gg; } }
+    if(!e->h[19]){ for(size_t i=0;i<(size_t)m*D;i++) x[i]+=v[i]; return; }
+    float *y=g->y[p], *hy=g->hy[p]; int dil=e->dil;
+    rmsnorm_fwd(v,e->nw[p],y,g->ri,m,D);
+    for(int j=0;j<m;j++) for(int d=0;d<D;d++){
+        float s=0;
+        for(int q=0;q<4&&start_pos+j>=q*dil;q++){ int r=j-q*dil;
+            s+=e->K[p][d*4+q]*(r>=0 ? y[(size_t)r*D+d] : hy[(size_t)(-r-1)*D+d]); }
+        x[(size_t)j*D+d]+=v[(size_t)j*D+d]+s/(1.0f+expf(-s)); }
+}
+static void eg_log(const Eg *e){
+    fprintf(stderr,"[eg] engram: S=%d (H=%d x %d orders) De=%d R=%d points=%d gate=%d conv=%d canon=%d %s iter %d\n",
+            e->S,e->h[0],e->h[1],e->De,e->h[7],e->np,e->h[21],e->h[19],e->h[20],e->tbl?"fp32":"q4",e->h[23]);
 }
 
 /* Streaming loader (TINYLM_NGSTREAM): keep Wng+scales in RAM (~4.5MB), leave the
@@ -2061,27 +2221,54 @@ fail: fclose(f); free(ng->Wng); free(ng->s); memset(ng,0,sizeof(*ng)); return 0;
 }
 
 /* Load n-gram table from .opt.ng sidecar (bigram embedding + q4 quantization) */
+/* cudalm .opt.t1 sidecar: "T1S1", int hdr[9]={attg,L,D,gate,De,mb,tri,layer,iter},
+ * optional Wg/Wk (+bf16 m,v) blocks, then float bias[L*mb]. */
+static void rbias_load(const char *base_path, const Cfg *c){
+    rbias_set(NULL,0);
+    char p[1100]; snprintf(p,sizeof p,"%s.opt.t1",base_path);
+    FILE *f=fopen(p,"rb"); if(!f) return;
+    char m[4]; int h[9]; float *b=NULL;
+    if(fread(m,1,4,f)==4 && !memcmp(m,"T1S1",4) && fread(h,4,9,f)==9 && h[5]>0 && c->n_exp>0
+       && h[1]==c->L && h[5]%c->n_exp==0){
+        long skip=(h[0]?(long)h[1]*h[2]*h[2]*8:0)+(h[3]?(long)h[4]*h[2]*8:0);
+        size_t n=(size_t)h[1]*h[5]; b=malloc(n*4);
+        if(fseek(f,skip,SEEK_CUR) || fread(b,4,n,f)!=n){ free(b); b=NULL; }
+        else { rbias_set(b,h[5]/c->n_exp); fprintf(stderr,"[t1] router bias %s (S=%d)\n",p,g_rbias_S); }
+    }
+    fclose(f);
+}
 static int ngram_load(const char *base_path, const Cfg *c, Ng *ng){
+    rbias_load(base_path,c);
     fprintf(stderr,"[ng] ngram_load called with base_path=%s\n", base_path); fflush(stderr);
     size_t blen=strlen(base_path);
     if(blen+5>=256) {fprintf(stderr,"[ng] path too long\n"); fflush(stderr); return 0;}
     char path[256]; strcpy(path,base_path); strcpy(path+blen,".opt.ng");
     fprintf(stderr,"[ng] trying to load: %s\n", path); fflush(stderr);
 
-    if(getenv("TINYLM_NGSTREAM")) return ngram_load_stream(path, c, ng);
-
-    size_t len; uint8_t *buf=read_file(path,&len);
+    size_t len; uint8_t *buf=NULL;
+    if(getenv("TINYLM_NGSTREAM")){
+        char mg[4]={0}; FILE *f=fopen(path,"rb"); if(f){ if(fread(mg,1,4,f)!=4) mg[0]=0; fclose(f); }
+        if(!memcmp(mg,"NGR1",4)) return ngram_load_stream(path, c, ng);
+    }
+    buf=read_file(path,&len);
     fprintf(stderr,"[ng] read_file returned: buf=%p len=%zu\n", (void*)buf, len); fflush(stderr);
     if(!buf) {fprintf(stderr,"[ng] no file, returning 0\n"); fflush(stderr); return 0;}  /* no n-gram file, silently ok */
 
-    Rd r={buf,buf+len}; char m[4]; rd(&r,m,4);
-    if(memcmp(m,"NGR1",4)){fprintf(stderr,"bad ngram magic\n"); fflush(stderr); free(buf); return 0;}
+    Rd r={buf,buf+len}; char m[4]={0}; rd(&r,m,4);
+    /* an unreadable sidecar is fatal: silently dropping the memory is the ngram-eval bug */
+    if(!memcmp(m,"NGR2",4)){
+        int h[24]; Eg *e=malloc(sizeof(Eg));
+        if(!rd(&r,h,sizeof h)||!eg_init(e,h,c)||!eg_read(&r,e,c->D)){
+            fprintf(stderr,"[eg] FATAL: cannot use engram table %s\n",path); exit(1); }
+        free(buf); memset(ng,0,sizeof(*ng)); ng->eg=e; eg_log(e); return 1;
+    }
+    if(memcmp(m,"NGR1",4)){fprintf(stderr,"[ng] FATAL: %s has unknown magic %.4s (need NGR1/NGR2)\n",path,m); exit(1);}
 
     int hdr[5]; rd(&r,hdr,4*5);  /* R, De, order, q4, iter */
     int R=hdr[0], De=hdr[1], order=hdr[2], q4=hdr[3];
     if(R<=0||R>=(1<<24)||De<=0||De>=1024||order!=2||q4!=1){
-        fprintf(stderr,"[ng] bad header: R=%d De=%d order=%d q4=%d\n",R,De,order,q4);
-        free(buf); return 0;
+        fprintf(stderr,"[ng] FATAL: unsupported NGR1 header R=%d De=%d order=%d q4=%d\n",R,De,order,q4);
+        exit(1);
     }
 
     int D=c->D; size_t nw=(size_t)De*D, nt=(size_t)R*De;
@@ -2186,7 +2373,7 @@ static float *gguf_load_full(const char *path, Cfg *c, Tok **tk_out, Ng *ng_out,
     uint64_t n_kv=gg_u64(p); p+=8;
     if(ver!=3){ fprintf(stderr,"unsupported GGUF version %u\n",ver); free(buf); return NULL; }
 
-    int have_cfg=0, hdr[15]={0}, has_ng=0, ngmeta[5]={0};
+    int have_cfg=0, hdr[15]={0}, has_ng=0, ngmeta[5]={0}, has_eg=0, eghdr[24]={0};
     for(uint64_t i=0;i<n_kv;i++){
         if(p+8>end) goto bad;
         uint64_t kl=gg_u64(p); p+=8;
@@ -2212,6 +2399,10 @@ static float *gguf_load_full(const char *path, Cfg *c, Tok **tk_out, Ng *ng_out,
             if(v+12<=end && gg_u32(v)==5){ uint64_t cnt=gg_u64(v+4);
                 int nn=cnt>5?5:(int)cnt;
                 if(v+12+4*(uint64_t)nn<=end) for(int j=0;j<nn;j++) ngmeta[j]=(int)gg_u32(v+12+4*j); }
+        } else if(kl==13 && !memcmp(key,"tinylm.engram",13) && vtype==9){
+            if(v+12<=end && gg_u32(v)==5 && gg_u64(v+4)==24 && v+12+96<=end){
+                for(int j=0;j<24;j++) eghdr[j]=(int)gg_u32(v+12+4*j); has_eg=1; }
+            else { fprintf(stderr,"GGUF: bad tinylm.engram header\n"); goto bad; }
         }
         if(!gg_skip_value(&p,end,vtype)) goto bad;
     }
@@ -2249,8 +2440,7 @@ static float *gguf_load_full(const char *path, Cfg *c, Tok **tk_out, Ng *ng_out,
         if((uint64_t)(end-qd) < qb){ free(ts); goto bad; }
         P=fz(n_par);
         Rd r={qd,qd+qb};
-        int ok = qtype==3 ? q4_selective_decode(&r,P,n_par,c,group)
-                          : dequantize_params(&r,P,n_par,qtype,group);
+        int ok = dequant_any(&r,P,n_par,c,3,qtype,group);
         if(!ok){ fprintf(stderr,"GGUF quant body decode failed\n"); free(P); free(ts); goto bad; }
         if(quant_out) *quant_out=1;
     } else {
@@ -2276,6 +2466,35 @@ static float *gguf_load_full(const char *path, Cfg *c, Tok **tk_out, Ng *ng_out,
         if((uint64_t)(end-td) >= tt->nelem) *tk_out=tok_parse(td,(size_t)tt->nelem,1);
     }
 
+    rbias_set(NULL,0);
+    GgTinfo *tb=gguf_find(ts,n_tensors,"tinylm.router_bias");
+    if(tb && tb->ttype==GG_F32 && c->n_exp>0 && tb->nelem%((uint64_t)c->L*c->n_exp)==0){
+        const uint8_t *bd=buf+data_base+tb->off;
+        if((uint64_t)(end-bd)>=tb->nelem*4){ float *b=malloc(tb->nelem*4); memcpy(b,bd,tb->nelem*4);
+            rbias_set(b,(int)(tb->nelem/((uint64_t)c->L*c->n_exp))); }
+    }
+    /* engram (NGR2): hash check + point weights + q4 or fp32 table; any mismatch is fatal */
+    if(has_eg && ng_out){
+        Eg *e=malloc(sizeof(Eg));
+        if(!eg_init(e,eghdr,c)){ fprintf(stderr,"GGUF: unsupported engram\n"); exit(1); }
+        GgTinfo *th=gguf_find(ts,n_tensors,"tinylm.engram.hash"), *tc=gguf_find(ts,n_tensors,"tinylm.engram.canon"),
+                *tw=gguf_find(ts,n_tensors,"tinylm.engram.w"), *td=gguf_find(ts,n_tensors,"tinylm.engram.digits"),
+                *tsc=gguf_find(ts,n_tensors,"tinylm.engram.scales"), *tt=gguf_find(ts,n_tensors,"tinylm.engram.table");
+        size_t nwf=(size_t)e->np*(e->nwp*(e->h[21]?2:1)+(e->h[19]?5*(size_t)c->D:0)), S=e->S;
+        #define EGT(t,n) ((t) && (t)->nelem==(uint64_t)(n) && (uint64_t)(end-(buf+data_base+(t)->off))>=(uint64_t)(n)*((t)->ttype==GG_F32?4:1))
+        int ok=EGT(th,S*36) && EGT(tw,nwf) && tw->ttype==GG_F32 && (!e->h[20]||EGT(tc,(size_t)c->V*2))
+             && (e->h[8] ? EGT(td,(e->nt+1)/2) && EGT(tsc,e->ngrp) && tsc->ttype==GG_F32 : EGT(tt,e->nt) && tt->ttype==GG_F32);
+        #undef EGT
+        if(ok){ const uint8_t *hp=buf+data_base+th->off;
+            ok=!memcmp(hp,e->prime,4*S) && !memcmp(hp+4*S,e->mult,32*S); }
+        if(!ok){ fprintf(stderr,"GGUF: engram tensors missing/mis-sized or hash scheme mismatch\n"); exit(1); }
+        memcpy(e->W,buf+data_base+tw->off,nwf*4);
+        if(e->h[20]){ e->cn=malloc((size_t)c->V*2); memcpy(e->cn,buf+data_base+tc->off,(size_t)c->V*2); }
+        if(e->h[8]){ e->d=malloc((e->nt+1)/2); memcpy(e->d,buf+data_base+td->off,(e->nt+1)/2);
+                     e->s=malloc(e->ngrp*4); memcpy(e->s,buf+data_base+tsc->off,e->ngrp*4); }
+        else { e->tbl=malloc(e->nt*4); memcpy(e->tbl,buf+data_base+tt->off,e->nt*4); }
+        ng_out->eg=e; eg_log(e);
+    }
     /* ngram */
     if(has_ng && ng_out){
         GgTinfo *gw=gguf_find(ts,n_tensors,"tinylm.ngram.wng");
@@ -2831,6 +3050,7 @@ typedef struct {
     float *hlog,*hh,*ht;              /* single-row scratch (main/MTP heads) */
     int   *posbuf;
     int    ng_prev;                   /* last committed token, feeds the n-gram hash across chunks */
+    struct EgGen *eg;                 /* engram decode state (token + conv history), lazily made */
     int   *moe_as; float *moe_gt,*moe_rp;    /* MoE routing scratch, allocated once:
                                                 forward_chunk used to malloc/free
                                                 three of these per layer per token */
@@ -3199,8 +3419,9 @@ static void moe_forward_q8(const Cfg *c, const Weights *w, const Gen *gn, int l,
         float inv=1.0f/s; for(int e=0;e<E;e++) rprobs[e]*=inv;
         memcpy(out, fin, sizeof(float)*D);           /* residual; slots accumulate onto it */
         int nbF=(F+31)/32, kpF=rowbytes(nbF);        /* weight row stride (int8 me_aq activation) */
+        moe_route(rprobs,E,l,K,me_sel);
         for(int k=0;k<K;k++){
-            int best=moe_kth(rprobs,E,k);
+            int best=me_sel[k];
             assign[0]=best; gate[0]=rprobs[best];
             if(g_rhist) g_rhist[(size_t)l*E+best]++;
             size_t qi=(size_t)l*E+best;
@@ -3215,8 +3436,9 @@ static void moe_forward_q8(const Cfg *c, const Weights *w, const Gen *gn, int l,
     mm(me_rt, fnorm, w->wr[l], N, D, E);
     { MoeRtJob rj={assign,gate,rprobs,E};  tl_for(N, moe_rt_body, &rj); }   /* normalizes rprobs */
     memcpy(out, fin, sizeof(float)*(size_t)N*D);
+    if(K>1||g_rbias) for(int n=0;n<N;n++) moe_route(rprobs+(size_t)n*E,E,l,K,me_sel+(size_t)n*K);
     for(int k=0;k<K;k++){
-        if(k) for(int n=0;n<N;n++){ int sel=moe_kth(rprobs+(size_t)n*E,E,k);
+        if(K>1||g_rbias) for(int n=0;n<N;n++){ int sel=me_sel[(size_t)n*K+k];
             assign[n]=sel; gate[n]=rprobs[(size_t)n*E+sel]; }
         if(g_rhist) for(int n=0;n<N;n++) g_rhist[(size_t)l*E+assign[n]]++;
         for(int e=0;e<E;e++){
@@ -3504,7 +3726,10 @@ static void forward_chunk(const Cfg *c, const Weights *w, Gen *gn,
                           gn->posbuf[j]=start_pos+j; }
     if(w->ng.R>0) ngram_forward(c, &w->ng, tokens, m, start_pos, start_pos>0?gn->ng_prev:-1, gn->x);
     gn->ng_prev=tokens[m-1];
+    const Eg *eg=w->ng.eg;
+    if(eg){ if(!gn->eg) gn->eg=eg_gen(c,eg); eg_begin(c,eg,gn->eg,tokens,m,start_pos); }
     for(int l=0;l<c->L;l++){
+        if(eg) eg_point(c,eg,gn->eg,l,m,start_pos,gn->x);
         rmsnorm_fwd(gn->x, w->an1[l], gn->xn, gn->rinv, m, D);
         /* One fused Q|K|V GEMV, then split the rows back out. The split copies
          * m*(D+2*KD) floats -- 3 KB at m=1, against the 655 KB of weights the
@@ -3646,6 +3871,24 @@ static float topk_thresh(const float *v, int n, int k, float *h){
  * doubles as the heap, which is finished with before the probabilities land in
  * it). Arithmetically the same as the old five-pass form: exp(l/T - max(l)/T)
  * == exp((l-max(l))/T), and the mask threshold is unchanged. */
+/* Defaults match cudalm chatbench's sample_ex: temp 0.7, top-p 0.9, no top-k, penalty 1.15
+ * over the current reply only (prompt tokens are never penalized). Env: TINYLM_TOPP,
+ * TINYLM_REP, TINYLM_REPWIN (0 = whole reply). */
+static void samp_env(float *topp, float *rep_pen, int *rep_win){
+    const char *e;
+    *topp    = (e=getenv("TINYLM_TOPP"))   ? (float)atof(e) : 0.9f;
+    *rep_pen = (e=getenv("TINYLM_REP"))    ? (float)atof(e) : 1.15f;
+    *rep_win = (e=getenv("TINYLM_REPWIN")) ? atoi(e) : 0;
+    if(*rep_pen<1.0f) *rep_pen=1.0f;
+}
+/* chatml end-of-turn, as cudalm: replies end with eot or "
+<|user|>"; stop on the marker's
+ * first token "<|". CUDALM_STOP_MARK=0 disables. */
+static int chat_stop_id(const Cfg *c, const Tok *tk){
+    const char *e=getenv("CUDALM_STOP_MARK");
+    if(c->tmpl!=2 || (e && !atoi(e))) return -1;
+    int n=0, *ids=tok_encode(tk,"<|user|>",&n), r=n>1?ids[0]:-1; free(ids); return r;
+}
 /* CTRL-style repetition penalty (Keskar et al. 2019): each token seen in the last
  * `rep_win` positions has its logit divided by `rep_pen` if positive, multiplied if
  * negative -- pushing its probability down either way. Applied once per unique token
@@ -3653,12 +3896,12 @@ static float topk_thresh(const float *v, int n, int k, float *h){
  * breaks the degenerate loops a low-capacity model falls into; it runs on a penalized
  * COPY (`work`) so the caller's logits row stays intact. `heap` is topk scratch. */
 static int sample_logits(const Cfg *c, const float *lg, float *work, float *heap,
-                         float temp, int topk, const int *hist, int hn,
+                         float temp, int topk, float topp, const int *hist, int hn,
                          float rep_pen, int rep_win){
     int V=c->V;
     for(int i=0;i<V;i++) work[i]=lg[i];
     if(rep_pen>1.0f && hn>0){
-        int lo = hn>rep_win ? hn-rep_win : 0;
+        int lo = rep_win>0 && hn>rep_win ? hn-rep_win : 0;
         for(int j=lo;j<hn;j++){
             int t=hist[j]; if(t<0||t>=V) continue;
             int dup=0; for(int u=lo;u<j;u++) if(hist[u]==t){dup=1;break;}
@@ -3666,12 +3909,19 @@ static int sample_logits(const Cfg *c, const float *lg, float *work, float *heap
             work[t] = work[t]>0 ? work[t]/rep_pen : work[t]*rep_pen;
         }
     }
-    if(topk<=1 || temp<=1e-4f) return argmax_v(work,V);
+    if(topk==1 || temp<=1e-4f) return argmax_v(work,V);
     float it = temp>1e-6f?temp:1e-6f;
     float thr = (topk>0 && topk<V) ? topk_thresh(work,V,topk,heap) : -3.0e38f;
     float mx=work[0]; for(int i=1;i<V;i++) if(work[i]>mx)mx=work[i];
     float sum=0.0f;
     for(int i=0;i<V;i++){ float e = work[i]>=thr ? expf((work[i]-mx)/it) : 0.0f; work[i]=e; sum+=e; }
+    if(topp>0.0f && topp<1.0f){   /* nucleus: bisect the largest p-threshold keeping >= topp mass (max p = 1) */
+        float lo=0.0f, hi=1.0f, need=topp*sum;
+        for(int k=0;k<30;k++){ float m=0.5f*(lo+hi), a=0.0f;
+            for(int i=0;i<V;i++) if(work[i]>=m) a+=work[i];
+            if(a>=need) lo=m; else hi=m; }
+        sum=0.0f; for(int i=0;i<V;i++){ if(work[i]<lo) work[i]=0.0f; sum+=work[i]; }
+    }
     float r=rnd_uniform()*sum, ac=0.0f;
     for(int i=0;i<V;i++){ ac+=work[i]; if(ac>=r) return i; }
     return V-1;
@@ -3708,12 +3958,11 @@ static void run_generation(const Cfg *c, const Weights *w, Gen *gn, const Tok *t
     /* repetition penalty (env-tunable, like TINYLM_Q8/NOSPEC). Default on and mild;
      * TINYLM_REP=1.0 disables. When active, the greedy self-speculative path is off
      * because its MTP drafting bypasses the sampler where the penalty lives. */
-    const char *rp_env=getenv("TINYLM_REP"); float rep_pen = rp_env?atof(rp_env):1.3f;
-    const char *rw_env=getenv("TINYLM_REPWIN"); int rep_win = rw_env?atoi(rw_env):128;
-    if(rep_pen<1.0f) rep_pen=1.0f;
+    float topp, rep_pen; int rep_win; samp_env(&topp,&rep_pen,&rep_win);
+    int stopid = stop_eot ? chat_stop_id(c,tk) : -1;
     if(getenv("TINYLM_ROUTER") && c->n_exp>0){
         free(g_rhist); g_rhist=calloc((size_t)c->L*c->n_exp,sizeof(long)); }
-    int spec = (c->n_mtp>0) && (topk<=1 || temp<=1e-4f) && !getenv("TINYLM_NOSPEC") && rep_pen<=1.0f;
+    int spec = (c->n_mtp>0) && (topk==1 || temp<=1e-4f) && !getenv("TINYLM_NOSPEC") && rep_pen<=1.0f;
     if(echo_prompt){ fputs(fmt,stdout); fflush(stdout); }
     int *hist=malloc(sizeof(int)*(size_t)(pn+nnew+8)); int hn=0;
     for(int i=0;i<pn;i++) hist[hn++]=pids[i];
@@ -3738,11 +3987,11 @@ static void run_generation(const Cfg *c, const Weights *w, Gen *gn, const Tok *t
             int x1=argmax_v(lg_cur, c->V); draft[0]=x1;
             for(int k=0;k<K;k++) draft[k+1]=mtp_argmax(c,w,gn,fn_cur,k);
             forward_chunk(c,w,gn,draft,K+1,pos); fwd_chunks++;
-            if(stop_eot && x1==tk->eot) done=1; else { tok_print(tk,x1); generated++; }
+            if(stop_eot && (x1==tk->eot || x1==stopid)) done=1; else { tok_print(tk,x1); generated++; }
             int n_acc=0;
             for(int r=0;r<K && !done && generated<nnew;r++){
                 int m_r=argmax_v(gn->logits+(size_t)r*c->V, c->V);
-                if(draft[r+1]==m_r){ if(stop_eot && m_r==tk->eot) done=1;
+                if(draft[r+1]==m_r){ if(stop_eot && (m_r==tk->eot || m_r==stopid)) done=1;
                                      else { tok_print(tk,m_r); generated++; n_acc++; } }
                 else break;
             }
@@ -3754,8 +4003,8 @@ static void run_generation(const Cfg *c, const Weights *w, Gen *gn, const Tok *t
         float *work=malloc(sizeof(float)*c->V);
         float *heap=malloc(sizeof(float)*(size_t)(topk>0?topk:1));
         while(generated<nnew){
-            int nxt=sample_logits(c, lg_cur, work, heap, temp, topk, hist, hn, rep_pen, rep_win);
-            if(stop_eot && nxt==tk->eot) break;
+            int nxt=sample_logits(c, lg_cur, work, heap, temp, topk, topp, hist+pn, hn-pn, rep_pen, rep_win);
+            if(stop_eot && (nxt==tk->eot || nxt==stopid)) break;
             tok_print(tk,nxt); fflush(stdout); generated++;
             hist[hn++]=nxt;
             forward_chunk(c,w,gn,&nxt,1,pos); fwd_chunks++; pos++;
@@ -3830,8 +4079,8 @@ static int cmd_gen(int argc, char **argv){
         P=model_load(argv[2],&c); tk=tok_load(argv[3],1); prompt=argv[4]; ai=5;
     }
     int nnew = argc>ai?atoi(argv[ai]):200;
-    float temp= argc>ai+1?atof(argv[ai+1]):0.8f;
-    int topk  = argc>ai+2?atoi(argv[ai+2]):40;
+    float temp= argc>ai+1?atof(argv[ai+1]):0.7f;
+    int topk  = argc>ai+2?atoi(argv[ai+2]):0;
     int stop_eot = argc>ai+3?atoi(argv[ai+3]):1;
     int use_q8 = is_gguf ? gg_quant
                          : (!memcmp(mg,"TLQ1",4) || !memcmp(mg,"TLQ2",4) || getenv("TINYLM_Q8")!=NULL);
@@ -3994,8 +4243,8 @@ static int cmd_run(int argc, char **argv){
     } else if(argc>3){ prompt=argv[3]; ai=4; }
     else interactive=1;
     int n   = argc>ai?atoi(argv[ai]):256;
-    float temp= argc>ai+1?atof(argv[ai+1]):0.8f;
-    int topk = argc>ai+2?atoi(argv[ai+2]):40;
+    float temp= argc>ai+1?atof(argv[ai+1]):0.7f;
+    int topk = argc>ai+2?atoi(argv[ai+2]):0;
 
     if(interactive){
         printf("[tinylm] %s | %s | %zu params | n_mtp=%d | temp=%.2f topk=%d\n",
@@ -4012,7 +4261,8 @@ static int cmd_run(int argc, char **argv){
         }
         printf("[bye]\n");
     } else {
-        printf("[tinylm] %s | temp=%.2f topk=%d | decode=%s\n", arg, temp, topk,
+        float tp, rp; int rw; samp_env(&tp,&rp,&rw);
+        printf("[tinylm] %s | temp=%.2f topk=%d topp=%.2f rep=%.2f | decode=%s\n", arg, temp, topk, tp, rp,
                g_q4?"int4":(gn->q8?"int8":"fp32"));
         printf("------------------------------------------------------------\n");
         run_generation(&c,&w,gn,tk, prompt, n, temp, topk, 1, /*echo*/1, /*stats*/1);
@@ -4056,7 +4306,7 @@ static int cmd_chat(int argc, char **argv){
         "usage: tinylm chat <name|model.bin> [max_tokens] [temp] [topk]\n"
         "  Multi-turn chat; the conversation stays in context between turns.\n"
         "  Commands:  /reset  clear the conversation   /quit  exit\n"
-        "  Defaults: max_tokens=256 temp=0.8 topk=40 (use temp 0 for greedy)\n"); return 1; }
+        "  Defaults: max_tokens=256 temp=0.7 topk=0 (off; top-p 0.9 via TINYLM_TOPP), temp 0 = greedy\n"); return 1; }
     char path[1024]; model_path(argv[2], path, sizeof(path));
     { FILE *e=fopen(path,"rb"); if(e) fclose(e); else snprintf(path,sizeof(path),"%s",argv[2]); }
     char mg[4]={0}; { FILE *qf=fopen(path,"rb"); if(qf){ if(fread(mg,1,4,qf)!=4) mg[0]=0; fclose(qf); } }
@@ -4074,11 +4324,10 @@ static int cmd_chat(int argc, char **argv){
     float *kept = gn->q8 ? gen_drop_fp32(&c,&w,&P) : NULL; (void)kept;
 
     int nmax  = argc>3?atoi(argv[3]):256;
-    float temp= argc>4?atof(argv[4]):0.8f;
-    int topk  = argc>5?atoi(argv[5]):40;
-    const char *rp_env=getenv("TINYLM_REP"); float rep_pen = rp_env?atof(rp_env):1.3f;
-    const char *rw_env=getenv("TINYLM_REPWIN"); int rep_win = rw_env?atoi(rw_env):128;
-    if(rep_pen<1.0f) rep_pen=1.0f;
+    float temp= argc>4?atof(argv[4]):0.7f;
+    int topk  = argc>5?atoi(argv[5]):0;
+    float topp, rep_pen; int rep_win; samp_env(&topp,&rep_pen,&rep_win);
+    int stopid = chat_stop_id(&c,tk);
 
     /* Absolute positions keep climbing across turns, so the RoPE tables must
      * cover more than one context. Past this budget the session is reset. */
@@ -4132,11 +4381,11 @@ static int cmd_chat(int argc, char **argv){
         if(!lg_cur) continue;
 
         printf("bot> "); fflush(stdout);
-        int rlen=0, printed=0, gen=0, cut=-1;
+        int rlen=0, printed=0, gen=0, cut=-1, rs=hn;
         double t0=wtime();
         while(gen<nmax){
-            int nxt=sample_logits(&c, lg_cur, work, heap, temp, topk, hist, hn, rep_pen, rep_win);
-            if(nxt==tk->eot) break;
+            int nxt=sample_logits(&c, lg_cur, work, heap, temp, topk, topp, hist+rs, hn-rs, rep_pen, rep_win);
+            if(nxt==tk->eot || nxt==stopid) break;
             if(hn<ropemax) hist[hn++]=nxt;
             int dl=tk->declen[nxt];
             if(rlen+dl >= CHAT_RESP) break;
@@ -4248,6 +4497,44 @@ static int cmd_quantize(int argc, char **argv){
  * Exists so other tools can work at the id level without reimplementing the
  * BPE: the JAX/TPU port needs the exact same ids tinylm produces, and an
  * independent tokenizer reimplementation is a silent-divergence risk. */
+/* tinylm nll <model> <windows.u16> <T> [mode]: mean next-token NLL over consecutive
+ * windows of T+1 uint16 tokens (cross-checks cudalm eval). mode 0: one chunk per
+ * window; k>0: chunks of k; -1: random chunk sizes 1..17; -2: random chunks with a
+ * random accepted prefix, re-running the rest (speculative-decode rejection path). */
+static int cmd_nll(int argc, char **argv){
+    if(argc<5){ fprintf(stderr,"usage: tinylm nll <model.bin|gguf> <windows.u16> <T> [mode]\n"); return 1; }
+    const char *path=argv[2]; int T=atoi(argv[4]), mode=argc>5?atoi(argv[5]):0;
+    char mg[4]={0}; { FILE *qf=fopen(path,"rb"); if(qf){ if(fread(mg,1,4,qf)!=4) mg[0]=0; fclose(qf); } }
+    int is_gguf=!memcmp(mg,"GGUF",4), gq=0;
+    Cfg c; Tok *tk=NULL; Ng gg_ng; memset(&gg_ng,0,sizeof(gg_ng));
+    float *P = is_gguf ? gguf_load_full(path,&c,&tk,&gg_ng,&gq) : model_load_full(path,&c,&tk);
+    if(!P) return 1;
+    Weights w; map_weights(&c,P,&w);
+    if(is_gguf) w.ng=gg_ng; else { memset(&w.ng,0,sizeof(w.ng)); ngram_load(path,&c,&w.ng); }
+    if(T<2||T>c.T||T>4095){ fprintf(stderr,"T must be 2..min(%d,4095)\n",c.T); return 1; }
+    Gen *gn=gen_new(&c,&w,0); rope_init(&c,c.T+8);
+    size_t len; uint16_t *tb=(uint16_t*)read_file(argv[3],&len); if(!tb) return 1;
+    size_t nw=len/2/(T+1); int V=c.V, tok[4096]; double tot=0; unsigned rs=12345;
+    float *lp=fz(T);
+    for(size_t wi=0;wi<nw;wi++){
+        const uint16_t *wt=tb+wi*(T+1); for(int j=0;j<=T;j++) tok[j]=wt[j];
+        for(int st=0;st<T;){
+            int m=mode>0?mode:mode<0?1+(int)((rs=rs*1103515245u+12345u)>>16)%(mode==-1?17:8):T;
+            if(m>T-st) m=T-st;
+            forward_chunk(&c,&w,gn,tok+st,m,st);
+            int a=mode==-2?1+(int)((rs=rs*1103515245u+12345u)>>16)%m:m;
+            for(int j=0;j<a;j++){ const float *lg=gn->logits+(size_t)j*V; float mx=-1e30f; double z=0;
+                for(int v=0;v<V;v++) if(lg[v]>mx) mx=lg[v];
+                for(int v=0;v<V;v++) z+=exp(lg[v]-mx);
+                lp[st+j]=(float)(mx+log(z)-lg[tok[st+j+1]]); }
+            st+=a;
+        }
+        double sw=0; for(int j=0;j<T;j++) sw+=lp[j];
+        printf("window %zu nll %.5f\n",wi,sw/T); tot+=sw/T;
+    }
+    printf("mean nll %.5f over %zu windows (mode %d)\n",tot/(nw?nw:1),nw,mode);
+    return 0;
+}
 static int cmd_tokenize(int argc, char **argv){
     if(argc<4){ fprintf(stderr,
         "usage: tinylm tokenize <name|model.bin> <in.txt> [out.bin]\n"
@@ -4550,6 +4837,7 @@ int main(int argc, char **argv){
     if(!strcmp(argv[1],"chat"))     return cmd_chat(argc,argv);
     if(!strcmp(argv[1],"quantize")) return cmd_quantize(argc,argv);
     if(!strcmp(argv[1],"score"))    return cmd_score(argc,argv);
+    if(!strcmp(argv[1],"nll"))      return cmd_nll(argc,argv);
     if(!strcmp(argv[1],"tokenize")) return cmd_tokenize(argc,argv);
     fprintf(stderr,"unknown command '%s'\n\n", argv[1]);
     print_help(); return 1;
