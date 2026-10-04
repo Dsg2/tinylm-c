@@ -27,6 +27,18 @@ must be findable at runtime — it is if `C:\msys64\mingw64\bin` is on PATH). Th
 non-BLAS build uses `restrict` + `-march=native` AVX2/512 FMA kernels and is fully
 self-contained.
 
+## Build (macOS, Apple Silicon)
+```
+# OpenMP via Homebrew's libomp (brew install libomp); Apple clang needs -Xpreprocessor
+cc -O3 -mcpu=native -ffast-math -Xpreprocessor -fopenmp \
+   -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -lomp \
+   -o tinylm tinylm.c -lm
+# without OpenMP (the decode thread pool still runs; training loops are single-threaded)
+cc -O3 -mcpu=native -ffast-math -o tinylm tinylm.c -lm
+```
+On arm64 the int8/q4 decode GEMV uses NEON (`sdot` when the CPU has it).
+`-DTINYLM_NO_SIMD` builds the portable scalar kernels on any CPU.
+
 ## Quick start — three commands
 
 ```bash
