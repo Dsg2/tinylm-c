@@ -22,14 +22,49 @@
 #include <math.h>
 #include <stdint.h>
 #include <time.h>
+#ifdef _WIN32
 #include <direct.h>      /* _mkdir (MinGW/Windows) for auto-creating out/ */
+#else
+#include <sys/stat.h>    /* mkdir */
+#include <unistd.h>
+#endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h> /* _NSGetExecutablePath */
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 #ifdef USE_BLAS          /* link -lopenblas; ~2-3x faster GEMM on AVX-512 */
 #include <openblas/cblas.h>
 #endif
+/* -DTINYLM_NO_SIMD builds the portable scalar kernels on any CPU */
+#if defined(TINYLM_NO_SIMD)
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+#define TL_X86 1
 #include <immintrin.h>   /* int8 GEMV decode kernel (AVX2) */
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#define TL_ARM64 1
+#include <arm_neon.h>    /* int8 GEMV decode kernel (NEON; sdot where available) */
+#endif
+
+/* POSIX spellings of the Win32 helpers used below */
+#ifdef _WIN32
+#define TL_SEP "\\"
+#else
+#define TL_SEP "/"
+#define _fseeki64 fseeko
+#define _ftelli64 ftello
+#define _mkdir(p) mkdir((p), 0755)
+#endif
+
+/* spin-wait hint for the decode pool */
+static inline void tl_pause(void){
+#if defined(TL_X86)
+    _mm_pause();
+#elif defined(TL_ARM64)
+    __asm__ __volatile__("yield");
+#endif
+}
 
 /* ----------------------------- config ----------------------------------- */
 typedef struct {
@@ -215,7 +250,7 @@ static void tlp_loop(long id){
         long t, spins=0;
         while((t=__atomic_load_n(&tlp_ticket,__ATOMIC_ACQUIRE))==seen){
             if(__atomic_load_n(&tlp_stop,__ATOMIC_RELAXED)) return;
-            if(++spins < 4000)       _mm_pause();
+            if(++spins < 4000)       tl_pause();
             else if(spins < 24000)   tl_yield();
             else                     tl_nap();
         }
@@ -241,7 +276,7 @@ static void tl_for(int n, tl_body fn, void *ctx){
     __atomic_store_n(&tlp_done,0,__ATOMIC_RELAXED);
     __atomic_add_fetch(&tlp_ticket,1,__ATOMIC_RELEASE);
     tlp_run(0);
-    while(__atomic_load_n(&tlp_done,__ATOMIC_ACQUIRE) < nt-1) _mm_pause();
+    while(__atomic_load_n(&tlp_done,__ATOMIC_ACQUIRE) < nt-1) tl_pause();
 }
 static void tlp_shutdown(void){
     if(g_pool_nt<=1) return;
@@ -269,6 +304,9 @@ static int tl_default_threads(void){
     np=omp_get_num_procs();
 #endif
     if(np<=0){ const char *p=getenv("NUMBER_OF_PROCESSORS"); np=p?atoi(p):0; }
+#ifndef _WIN32
+    if(np<=0) np=(int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     if(np<=0) np=4;
     if(np>TL_MAXT) np=TL_MAXT;
     return np>2 ? np-1 : np;
@@ -299,11 +337,27 @@ static void tlp_init(void){
 
 /* directory containing the running executable, so named models live in one place
  * (models/ next to tinylm.exe) regardless of the current working directory. */
+#ifdef _WIN32
 __declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(void*, char*, unsigned long);
+#endif
+/* full path of the running executable into path[cap]; length, or 0 if unknown */
+static unsigned long exe_path(char *path, unsigned long cap){
+#if defined(_WIN32)
+    unsigned long n=GetModuleFileNameA(0, path, cap);
+    return n<cap ? n : 0;
+#elif defined(__APPLE__)
+    uint32_t sz=(uint32_t)cap;
+    if(_NSGetExecutablePath(path,&sz)!=0) return 0;
+    return (unsigned long)strlen(path);
+#else
+    ssize_t n=readlink("/proc/self/exe", path, cap-1);
+    return (n>0 && (unsigned long)n<cap) ? (unsigned long)n : 0;
+#endif
+}
 static const char *exe_dir(void){
     static char dir[1024]; static int done=0;
     if(done) return dir;
-    char path[1024]; unsigned long n=GetModuleFileNameA(0, path, sizeof(path));
+    char path[1024]; unsigned long n=exe_path(path, sizeof(path));
     if(n==0 || n>=sizeof(path)){ strcpy(dir,"."); done=1; return dir; }
     path[n]=0;
     char *last=path; for(char *q=path; *q; q++) if(*q=='/'||*q=='\\') last=q;
@@ -313,8 +367,8 @@ static const char *exe_dir(void){
 }
 /* build "<exe_dir>/models/<name>.bin" and ensure the models/ dir exists */
 static void model_path(const char *name, char *buf, size_t n){
-    char mdir[700]; snprintf(mdir,sizeof(mdir),"%.690s\\models", exe_dir()); _mkdir(mdir);
-    snprintf(buf,n,"%.700s\\%.200s.bin", mdir, name);
+    char mdir[700]; snprintf(mdir,sizeof(mdir),"%.690s" TL_SEP "models", exe_dir()); _mkdir(mdir);
+    snprintf(buf,n,"%.700s" TL_SEP "%.200s.bin", mdir, name);
 }
 
 /* ----------------------------- weights ---------------------------------- */
@@ -2802,12 +2856,35 @@ static int cmd_new(int argc, char **argv){
  * sign trick for signed int8. Weights are pre-quantized once at gen-load into an
  * output-major [N][K] layout (emb is already [V][D]; the [K][N] linear weights
  * are transposed). Memory-bound GEMV, so ~3-4x the fp32 OpenBLAS path.          */
+#if defined(TL_ARM64)
+/* acc += 32-element int8 dot of (a0|a1) and (b0|b1), as four int32 lanes.
+ * Integer-exact like the AVX2 maddubs/madd pair: |a*b| <= 127*128, so the
+ * int16 pair sums of the fallback cannot overflow. */
+static inline int32x4_t tl_dot32_s32(int32x4_t acc, int8x16_t a0, int8x16_t a1,
+                                     int8x16_t b0, int8x16_t b1){
+#if defined(__ARM_FEATURE_DOTPROD)
+    acc=vdotq_s32(acc,a0,b0); return vdotq_s32(acc,a1,b1);
+#else
+    int16x8_t p=vmull_s8(vget_low_s8(a0),vget_low_s8(b0));
+    p=vmlal_s8(p,vget_high_s8(a0),vget_high_s8(b0)); acc=vpadalq_s16(acc,p);
+    p=vmull_s8(vget_low_s8(a1),vget_low_s8(b1));
+    p=vmlal_s8(p,vget_high_s8(a1),vget_high_s8(b1)); return vpadalq_s16(acc,p);
+#endif
+}
+#endif
 static inline int dot_i8_32(const int8_t *a, const int8_t *b){
+#if defined(TL_X86)
     __m256i va=_mm256_loadu_si256((const __m256i*)a), vb=_mm256_loadu_si256((const __m256i*)b);
     __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(va,va), _mm256_sign_epi8(vb,va));
     __m256i s=_mm256_madd_epi16(p,_mm256_set1_epi16(1));
     __m128i t=_mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s,1));
     t=_mm_hadd_epi32(t,t); t=_mm_hadd_epi32(t,t); return _mm_cvtsi128_si32(t);
+#elif defined(TL_ARM64)
+    return vaddvq_s32(tl_dot32_s32(vdupq_n_s32(0), vld1q_s8(a), vld1q_s8(a+16),
+                                   vld1q_s8(b), vld1q_s8(b+16)));
+#else
+    int s=0; for(int j=0;j<32;j++) s+=(int)a[j]*(int)b[j]; return s;
+#endif
 }
 /* One full int8 row dot: sum_b scale_b * <w_b, x_b> over nb blocks of 32.
  *
@@ -2864,6 +2941,7 @@ static inline float q4dot_row(const uint8_t *wr, const float *ws,
         }
         return a;
     }
+#if defined(TL_X86)
     const __m128i m0f=_mm_set1_epi8(0x0F), eight=_mm_set1_epi8(8);
     __m256 acc=_mm256_setzero_ps();
     for(int b=0;b<nb;b++){
@@ -2886,6 +2964,31 @@ static inline float q4dot_row(const uint8_t *wr, const float *ws,
     __m128 r=_mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc,1));
     r=_mm_hadd_ps(r,r); r=_mm_hadd_ps(r,r);
     return _mm_cvtss_f32(r);
+#elif defined(TL_ARM64)
+    const int8x16_t eight=vdupq_n_s8(8);
+    float32x4_t acc=vdupq_n_f32(0.0f);
+    for(int b=0;b<nb;b++){
+        uint8x16_t v=vld1q_u8(wr+(size_t)b*16);
+        int8x16_t lo=vreinterpretq_s8_u8(vandq_u8(v,vdupq_n_u8(0x0F)));
+        int8x16_t hi=vreinterpretq_s8_u8(vshrq_n_u8(v,4));
+        lo=vsubq_s8(veorq_s8(lo,eight),eight);            /* (n^8)-8 == n>=8?n-16:n */
+        hi=vsubq_s8(veorq_s8(hi,eight),eight);
+        const int8_t *xb=xq+(size_t)b*32;                 /* zip: lanes w0..w31 in order */
+        int32x4_t s=tl_dot32_s32(vdupq_n_s32(0), vzip1q_s8(lo,hi), vzip2q_s8(lo,hi),
+                                 vld1q_s8(xb), vld1q_s8(xb+16));
+        acc=vfmaq_n_f32(acc, vcvtq_f32_s32(s), ws[b]*xs[b]);
+    }
+    return vaddvq_f32(acc);
+#else
+    float a=0.0f;
+    for(int b=0;b<nb;b++){
+        const uint8_t *o=wr+(size_t)b*16; int8_t t[32];
+        for(int p=0;p<16;p++){ int lo=o[p]&0xF, hi=o[p]>>4;
+            if(lo>=8)lo-=16; if(hi>=8)hi-=16; t[2*p]=(int8_t)lo; t[2*p+1]=(int8_t)hi; }
+        a += ws[b]*xs[b]*(float)dot_i8_32(t, xq+(size_t)b*32);
+    }
+    return a;
+#endif
 }
 static inline float qdot_row(const int8_t *wr, const float *ws,
                              const int8_t *xq, const float *xs, int nb){
@@ -2896,6 +2999,7 @@ static inline float qdot_row(const int8_t *wr, const float *ws,
             a += ws[b]*xs[b]*(float)dot_i8_32(wr+(size_t)b*32, xq+(size_t)b*32);
         return a;
     }
+#if defined(TL_X86)
     __m256 acc=_mm256_setzero_ps();
     for(int b=0;b<nb;b++){
         __m256i va=_mm256_loadu_si256((const __m256i*)(wr+(size_t)b*32));
@@ -2911,6 +3015,21 @@ static inline float qdot_row(const int8_t *wr, const float *ws,
     __m128 lo=_mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc,1));
     lo=_mm_hadd_ps(lo,lo); lo=_mm_hadd_ps(lo,lo);
     return _mm_cvtss_f32(lo);
+#elif defined(TL_ARM64)
+    float32x4_t acc=vdupq_n_f32(0.0f);
+    for(int b=0;b<nb;b++){
+        const int8_t *w=wr+(size_t)b*32, *x=xq+(size_t)b*32;
+        int32x4_t s=tl_dot32_s32(vdupq_n_s32(0), vld1q_s8(w), vld1q_s8(w+16),
+                                 vld1q_s8(x), vld1q_s8(x+16));
+        acc=vfmaq_n_f32(acc, vcvtq_f32_s32(s), ws[b]*xs[b]);
+    }
+    return vaddvq_f32(acc);
+#else
+    float a=0.0f;
+    for(int b=0;b<nb;b++)
+        a += ws[b]*xs[b]*(float)dot_i8_32(wr+(size_t)b*32, xq+(size_t)b*32);
+    return a;
+#endif
 }
 /* quantize x[K] to Q8 blocks of 32 (last block zero-padded to 32) */
 static void q8_row(const float *x, int K, int8_t *q, float *s){
@@ -4689,6 +4808,7 @@ static void print_help(void){
 /* ----------------------------- bench ------------------------------------ */
 /* Peak working set (RAM) via kernel32 — no extra link libs needed.
  * Struct matches PROCESS_MEMORY_COUNTERS under MinGW x64 (LLP64: long=4, size_t=8). */
+#ifdef _WIN32
 typedef struct { unsigned long cb, PageFaultCount;
     size_t Peak, Cur, q0,q1,q2,q3,pf0,pf1; } ProcMem_;
 __declspec(dllimport) void* __stdcall GetCurrentProcess(void);
@@ -4699,6 +4819,19 @@ static double peak_ram_mb(void){
         return (double)pm.Peak/(1024.0*1024.0);
     return 0.0;
 }
+#else
+#include <sys/resource.h>
+/* peak RSS; ru_maxrss is bytes on macOS and KiB on Linux */
+static double peak_ram_mb(void){
+    struct rusage ru;
+    if(getrusage(RUSAGE_SELF,&ru)!=0) return 0.0;
+#ifdef __APPLE__
+    return (double)ru.ru_maxrss/(1024.0*1024.0);
+#else
+    return (double)ru.ru_maxrss/1024.0;
+#endif
+}
+#endif
 
 /* Time real forward+backward+AdamW steps on random tokens — measures training
  * throughput for any preset without a dataset or waiting for the iter-50 report. */
@@ -4797,9 +4930,13 @@ static int cmd_selftest(int argc, char **argv){
  * to arrange this via crtfastmath.o, but MinGW does not reliably link it, and
  * MXCSR is per-thread so the OpenMP workers would each need it anyway. */
 static void set_ftz(void){
-#if defined(__SSE2__) || defined(__x86_64__)
+#if defined(TL_X86) && (defined(__SSE2__) || defined(__x86_64__))
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#elif defined(TL_ARM64) && !defined(_MSC_VER)
+    uint64_t fpcr; __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (uint64_t)1<<24;                                  /* FPCR.FZ */
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr));
 #endif
 }
 int main(int argc, char **argv){
